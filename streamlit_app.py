@@ -710,14 +710,38 @@ def _blank_source_row(df: pd.DataFrame) -> Dict:
 
 def _default_shareholders_table() -> pd.DataFrame:
     data = [
-        {"Shareholder": "Founders", "Ownership %": 0.35, "Investment": 25_000_000},
-        {"Shareholder": "Series A fund", "Ownership %": 0.4, "Investment": 80_000_000},
+        {
+            "Shareholder": "Founders",
+            "Security": "Common",
+            "Seniority": 3,
+            "Ownership %": 0.35,
+            "Investment": 25_000_000,
+            "Liquidation preference (x)": 0.0,
+            "Participating preferred": False,
+        },
+        {
+            "Shareholder": "Series A fund",
+            "Security": "Preferred",
+            "Seniority": 1,
+            "Ownership %": 0.4,
+            "Investment": 80_000_000,
+            "Liquidation preference (x)": 1.0,
+            "Participating preferred": False,
+        },
     ]
     return pd.DataFrame(data)
 
 
 def _blank_shareholder_row(df: pd.DataFrame) -> Dict:
-    return {"Shareholder": "New investor", "Ownership %": 0.05, "Investment": 0.0}
+    return {
+        "Shareholder": "New investor",
+        "Security": "Preferred",
+        "Seniority": 1,
+        "Ownership %": 0.05,
+        "Investment": 0.0,
+        "Liquidation preference (x)": 1.0,
+        "Participating preferred": False,
+    }
 
 
 def _default_market_sizes_table() -> pd.DataFrame:
@@ -1519,6 +1543,7 @@ def _widget_value(label: str, value, key: str):
     bool_like = isinstance(value, (bool, np.bool_)) or label_lower in {
         "include_in_consolidation",
         "consolidation",
+        "participating preferred",
     }
     if bool_like:
         return st.checkbox(label, value=bool(value), key=key)
@@ -2220,6 +2245,7 @@ def _default_debt_schedule(first_year: int, n_years: int) -> pd.DataFrame:
         {
             "Year": years,
             "Debt drawdowns": [0.0] * len(years),
+            "Manual debt repayments": [0.0] * len(years),
         }
     )
 
@@ -2232,11 +2258,47 @@ def _blank_debt_schedule_row(df: pd.DataFrame, first_year: int, n_years: int) ->
     return {
         "Year": year,
         "Debt drawdowns": 0.0,
+        "Manual debt repayments": 0.0,
     }
 
 
 def _coerce_numeric(series: pd.Series, default: float = 0.0) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(default)
+
+
+def _coerce_frame_column(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column in df.columns:
+        return pd.to_numeric(df[column], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _align_table_to_template(df: Optional[pd.DataFrame], template: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return template.copy()
+    aligned = df.copy()
+    if aligned.empty and not list(aligned.columns):
+        return template.copy()
+    for col in template.columns:
+        if col not in aligned.columns:
+            default_value = template[col].iloc[0] if not template.empty else ""
+            aligned[col] = default_value
+    ordered_cols = list(template.columns) + [col for col in aligned.columns if col not in template.columns]
+    return aligned[ordered_cols]
+
+
+def _roll_cash_balances(cash_flow_df: pd.DataFrame, opening_cash: float = 0.0) -> pd.DataFrame:
+    updated = cash_flow_df.copy()
+    net_cash = _coerce_frame_column(updated, "Net change in cash")
+    beginning_cash: List[float] = []
+    ending_cash: List[float] = []
+    current_cash = float(opening_cash or 0.0)
+    for year in updated.index:
+        beginning_cash.append(current_cash)
+        current_cash += float(net_cash.loc[year])
+        ending_cash.append(current_cash)
+    updated["Beginning cash balance"] = pd.Series(beginning_cash, index=updated.index)
+    updated["Ending cash balance"] = pd.Series(ending_cash, index=updated.index)
+    return updated
 
 
 def _recompute_vaccine_sales_implied_revenue(df: pd.DataFrame) -> pd.DataFrame:
@@ -2819,6 +2881,7 @@ def _compute_financial_statements(
             "Ending cash balance": ending_cash,
         }
     )
+    cash_flow_df = _roll_cash_balances(cash_flow_df, opening_cash=0.0)
 
     return perf_df, position_df, cash_flow_df
 
@@ -3513,11 +3576,23 @@ def _build_snapshot_from_result(
     if opex_available:
         opex_annual = -float(cons[opex_available].sum(axis=1).mean())
     revenue_annual = float(cons["revenue"].mean()) if "revenue" in cons.columns else None
+    dscr_min = None
+    financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
+    lender_metrics = financing_outputs.get("lender_metrics", pd.DataFrame())
+    if isinstance(lender_metrics, pd.DataFrame) and not lender_metrics.empty and "DSCR" in lender_metrics.columns:
+        finite_dscr = (
+            pd.to_numeric(lender_metrics["DSCR"], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if not finite_dscr.empty:
+            dscr_min = float(finite_dscr.min())
+    financing_settings = _financing_settings_from_state()
     snapshot = {
         "currency": model_cfg.currency,
         "npv": valuation_result.enterprise_value,
         "irr": irr,
-        "dscr_min": None,
+        "dscr_min": dscr_min,
         "payback_years": payback,
         "capex_total": capex_total,
         "opex_annual": opex_annual,
@@ -3532,6 +3607,10 @@ def _build_snapshot_from_result(
             "terminal_method": getattr(model_cfg, "terminal_method", "exit_multiple"),
             "perpetuity_growth_rate": getattr(model_cfg, "perpetuity_growth_rate", None),
             "opening_nol_balance": getattr(model_cfg, "opening_nol_balance", 0.0),
+            "debt_interest_rate": financing_settings["interest_rate"],
+            "debt_repayment_mode": financing_settings["repayment_mode"],
+            "debt_target_dscr": financing_settings["target_dscr"],
+            "minimum_cash_reserve": financing_settings["minimum_cash_reserve"],
         },
     }
     return snapshot
@@ -3689,6 +3768,8 @@ def _build_financial_excel(
     position_df: pd.DataFrame,
     cash_flow_df: pd.DataFrame,
     model_cfg: Optional[ModelConfig] = None,
+    lender_metrics: Optional[pd.DataFrame] = None,
+    investor_waterfall: Optional[pd.DataFrame] = None,
 ) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -3696,6 +3777,10 @@ def _build_financial_excel(
         perf_df.to_excel(writer, sheet_name="Financial performance")
         position_df.to_excel(writer, sheet_name="Financial position")
         cash_flow_df.to_excel(writer, sheet_name="Cash flows")
+        if lender_metrics is not None and not lender_metrics.empty:
+            lender_metrics.to_excel(writer, sheet_name="Debt metrics")
+        if investor_waterfall is not None and not investor_waterfall.empty:
+            investor_waterfall.to_excel(writer, sheet_name="Investor waterfall", index=False)
         dashboard_cols = [col for col in ["revenue", "ebitda", "fcff_after_wc"] if col in cons.columns]
         dashboard_df = cons[dashboard_cols].copy()
         dashboard_df.to_excel(writer, sheet_name="Dashboard")
@@ -3743,6 +3828,10 @@ def _build_financial_excel(
         }.items():
             ws = workbook[name]
             _format_excel_sheet(ws, df)
+        if lender_metrics is not None and not lender_metrics.empty:
+            _format_excel_sheet(workbook["Debt metrics"], lender_metrics)
+        if investor_waterfall is not None and not investor_waterfall.empty:
+            _format_excel_table(workbook["Investor waterfall"], investor_waterfall, start_row=1)
 
         if not analytics_df.empty:
             ws = workbook["Advanced analytics"]
@@ -3780,6 +3869,18 @@ def _build_financial_excel(
                 data_max_col=1 + analytics_df.shape[1],
                 data_max_row=max_row,
                 anchor="H2",
+            )
+
+        if lender_metrics is not None and not lender_metrics.empty and "DSCR" in lender_metrics.columns:
+            ws = workbook["Debt metrics"]
+            max_row = lender_metrics.shape[0] + 1
+            _add_line_chart(
+                ws,
+                title="Debt Coverage",
+                data_min_col=2,
+                data_max_col=min(4, 1 + lender_metrics.shape[1]),
+                data_max_row=max_row,
+                anchor="J2",
             )
 
         if not scenario_df.empty:
@@ -4427,16 +4528,27 @@ def _apply_cash_flow_assumptions(
         + updated["Net cash from investing"]
         + updated["Net cash from financing"]
     )
-    updated["Beginning cash balance"] = pd.Series(beginning_cash, index=years)
-    updated["Ending cash balance"] = beginning_cash + updated["Net change in cash"].cumsum()
+    return _roll_cash_balances(updated, opening_cash=beginning_cash)
 
-    return updated
+
+def _financing_settings_from_state() -> Dict[str, object]:
+    return {
+        "interest_rate": float(st.session_state.get("debt_interest_rate", 0.0)),
+        "repayment_mode": str(st.session_state.get("debt_repayment_mode", "straight_line") or "straight_line"),
+        "grace_years": int(st.session_state.get("debt_grace_years", 0) or 0),
+        "target_dscr": float(st.session_state.get("debt_target_dscr", 1.3) or 1.3),
+        "minimum_cash_reserve": float(st.session_state.get("minimum_cash_reserve", 0.0) or 0.0),
+    }
 
 
 def _apply_debt_schedule(
     cash_flow_df: Optional[pd.DataFrame],
     debt_schedule: Optional[pd.DataFrame],
     interest_rate: float,
+    repayment_mode: str = "straight_line",
+    grace_years: int = 0,
+    target_dscr: float = 1.3,
+    minimum_cash_reserve: float = 0.0,
 ) -> Optional[pd.DataFrame]:
     if cash_flow_df is None or cash_flow_df.empty:
         return cash_flow_df
@@ -4448,6 +4560,8 @@ def _apply_debt_schedule(
     if "Year" not in schedule.columns:
         return cash_flow_df
 
+    template = _default_debt_schedule(int(updated.index.min()), len(updated.index))
+    schedule = _align_table_to_template(schedule, template)
     schedule["Year"] = pd.to_numeric(schedule["Year"], errors="coerce").astype("Int64")
     schedule = schedule.dropna(subset=["Year"]).set_index("Year")
     if schedule.index.has_duplicates:
@@ -4455,49 +4569,167 @@ def _apply_debt_schedule(
     schedule = schedule.reindex(updated.index).fillna(0.0)
 
     drawdowns = pd.to_numeric(schedule.get("Debt drawdowns", 0.0), errors="coerce").fillna(0.0)
+    manual_repayments = (
+        pd.to_numeric(schedule.get("Manual debt repayments", 0.0), errors="coerce").fillna(0.0)
+    )
+    net_ops = _coerce_frame_column(updated, "Net cash from operations")
+    net_investing = _coerce_frame_column(updated, "Net cash from investing")
+    equity_issuance = _coerce_frame_column(updated, "Equity issuance")
+    normalized_mode = str(repayment_mode or "straight_line").strip().lower()
+    grace_periods = max(int(grace_years or 0), 0)
+    reserve_floor = max(float(minimum_cash_reserve or 0.0), 0.0)
+    dscr_target = max(float(target_dscr or 1.3), 0.01)
+    opening_cash = 0.0
+    if "Beginning cash balance" in updated.columns and not updated.empty:
+        opening_cash = float(
+            pd.to_numeric(updated["Beginning cash balance"], errors="coerce").fillna(0.0).iloc[0]
+        )
     begin_balances = []
     principal_repayments = []
     interest_charges = []
     end_balances = []
+    beginning_cash = []
+    ending_cash = []
+    net_financing = []
+    net_change = []
     balance = 0.0
+    cash_balance = opening_cash
     years = list(updated.index)
     total_years = len(years)
     for idx, year in enumerate(years):
         draw = float(drawdowns.loc[year]) if year in drawdowns.index else 0.0
-        remaining_periods = max(total_years - idx, 1)
-        principal = (balance + draw) / remaining_periods
+        manual_principal = float(manual_repayments.loc[year]) if year in manual_repayments.index else 0.0
+        outstanding = max(balance + draw, 0.0)
         interest = balance * float(interest_rate)
-        end_balance = balance + draw - principal
+        if idx == total_years - 1:
+            desired_principal = outstanding
+        elif normalized_mode == "manual":
+            desired_principal = manual_principal
+        elif idx < grace_periods:
+            desired_principal = 0.0
+        elif normalized_mode == "bullet":
+            desired_principal = 0.0
+        elif normalized_mode == "sculpted_dscr":
+            cfads = float(net_ops.loc[year] + net_investing.loc[year])
+            max_service = max(cfads / dscr_target, 0.0)
+            desired_principal = max(max_service - interest, 0.0)
+        else:
+            remaining_periods = max(total_years - max(idx, grace_periods), 1)
+            desired_principal = outstanding / remaining_periods
+
+        cash_before_principal = (
+            cash_balance
+            + float(net_ops.loc[year])
+            + float(net_investing.loc[year])
+            + float(equity_issuance.loc[year])
+            + draw
+            - interest
+        )
+        principal = min(max(desired_principal, 0.0), outstanding)
+        if idx < total_years - 1:
+            principal = min(principal, max(cash_before_principal - reserve_floor, 0.0))
+        end_balance = max(outstanding - principal, 0.0)
+        financing_cash = float(equity_issuance.loc[year]) + draw - principal - interest
+        total_cash_change = float(net_ops.loc[year] + net_investing.loc[year] + financing_cash)
+        ending_cash_balance = cash_balance + total_cash_change
 
         begin_balances.append(balance)
         principal_repayments.append(principal)
         interest_charges.append(interest)
         end_balances.append(end_balance)
+        beginning_cash.append(cash_balance)
+        ending_cash.append(ending_cash_balance)
+        net_financing.append(financing_cash)
+        net_change.append(total_cash_change)
 
         balance = end_balance
+        cash_balance = ending_cash_balance
 
     updated["Debt drawdowns"] = pd.Series(drawdowns.values, index=updated.index)
+    updated["Manual debt repayments"] = pd.Series(manual_repayments.values, index=updated.index)
     updated["Debt opening balance"] = pd.Series(begin_balances, index=updated.index)
     updated["Debt repayments"] = pd.Series(principal_repayments, index=updated.index)
     updated["Interest paid"] = pd.Series(interest_charges, index=updated.index)
     updated["Debt closing balance"] = pd.Series(end_balances, index=updated.index)
-
-    updated["Net cash from financing"] = (
-        updated.get("Equity issuance", 0.0)
-        + updated.get("Debt drawdowns", 0.0)
-        - updated.get("Debt repayments", 0.0)
-        - updated.get("Interest paid", 0.0)
-    )
-    updated["Net change in cash"] = (
-        updated.get("Net cash from operations", 0.0)
-        + updated.get("Net cash from investing", 0.0)
-        + updated.get("Net cash from financing", 0.0)
-    )
-    if "Beginning cash balance" in updated.columns:
-        beginning_cash = updated["Beginning cash balance"].fillna(0.0)
-        updated["Ending cash balance"] = beginning_cash + updated["Net change in cash"].cumsum()
+    updated["Net cash from financing"] = pd.Series(net_financing, index=updated.index)
+    updated["Net change in cash"] = pd.Series(net_change, index=updated.index)
+    updated["Beginning cash balance"] = pd.Series(beginning_cash, index=updated.index)
+    updated["Ending cash balance"] = pd.Series(ending_cash, index=updated.index)
 
     return updated
+
+
+def _build_lender_metrics(
+    cash_flow_df: Optional[pd.DataFrame],
+    discount_rate: float,
+    minimum_cash_reserve: float = 0.0,
+    target_dscr: float = 1.3,
+) -> pd.DataFrame:
+    if cash_flow_df is None or cash_flow_df.empty:
+        return pd.DataFrame()
+
+    cfads = _coerce_frame_column(cash_flow_df, "Net cash from operations") + _coerce_frame_column(
+        cash_flow_df, "Net cash from investing"
+    )
+    opening_balance = _coerce_frame_column(cash_flow_df, "Debt opening balance")
+    closing_balance = _coerce_frame_column(cash_flow_df, "Debt closing balance")
+    principal = _coerce_frame_column(cash_flow_df, "Debt repayments")
+    interest = _coerce_frame_column(cash_flow_df, "Interest paid")
+    debt_service = principal + interest
+    ending_cash = _coerce_frame_column(cash_flow_df, "Ending cash balance")
+    reserve_headroom = ending_cash - float(minimum_cash_reserve or 0.0)
+    dscr = pd.Series(np.where(debt_service > 0, cfads / debt_service, np.nan), index=cash_flow_df.index)
+    discount = max(float(discount_rate or 0.0), 0.0)
+
+    active_debt = (opening_balance > 0) | (closing_balance > 0) | (debt_service > 0)
+    active_positions = np.flatnonzero(active_debt.to_numpy())
+    last_debt_period = int(active_positions[-1]) if len(active_positions) else -1
+
+    llcr_values: List[float] = []
+    plcr_values: List[float] = []
+    covenant_status: List[str] = []
+    cfads_values = cfads.astype(float).to_numpy()
+    opening_values = opening_balance.astype(float).to_numpy()
+
+    for idx, year in enumerate(cash_flow_df.index):
+        open_balance = opening_values[idx]
+        if open_balance <= 0:
+            llcr_values.append(np.nan)
+            plcr_values.append(np.nan)
+            covenant_status.append("N/A")
+            continue
+
+        future_cfads = cfads_values[idx:]
+        offsets = np.arange(len(future_cfads), dtype=float)
+        pv_project = float((future_cfads / np.power(1.0 + discount, offsets)).sum())
+        if last_debt_period >= idx:
+            debt_term_cfads = cfads_values[idx : last_debt_period + 1]
+            debt_offsets = np.arange(len(debt_term_cfads), dtype=float)
+            pv_debt_term = float((debt_term_cfads / np.power(1.0 + discount, debt_offsets)).sum())
+        else:
+            pv_debt_term = 0.0
+        llcr_values.append(pv_debt_term / open_balance)
+        plcr_values.append(pv_project / open_balance)
+
+        status_parts: List[str] = []
+        if not np.isnan(dscr.loc[year]) and float(dscr.loc[year]) < float(target_dscr):
+            status_parts.append("DSCR breach")
+        if float(reserve_headroom.loc[year]) < 0:
+            status_parts.append("Reserve breach")
+        covenant_status.append("Pass" if not status_parts else " + ".join(status_parts))
+
+    return pd.DataFrame(
+        {
+            "CFADS": cfads,
+            "Debt service": debt_service,
+            "DSCR": dscr,
+            "LLCR": pd.Series(llcr_values, index=cash_flow_df.index),
+            "PLCR": pd.Series(plcr_values, index=cash_flow_df.index),
+            "Minimum cash reserve": pd.Series(float(minimum_cash_reserve or 0.0), index=cash_flow_df.index),
+            "Cash reserve headroom": reserve_headroom,
+            "Covenant status": pd.Series(covenant_status, index=cash_flow_df.index),
+        }
+    )
 
 
 def _build_enterprise_to_equity_bridge(
@@ -4531,6 +4763,151 @@ def _build_enterprise_to_equity_bridge(
             {"Component": "Post-money equity value", "Amount": post_money_equity},
         ]
     )
+
+
+def _build_investor_waterfall(
+    shareholders_df: Optional[pd.DataFrame],
+    exit_equity_value: float,
+) -> pd.DataFrame:
+    if shareholders_df is None or shareholders_df.empty:
+        return pd.DataFrame()
+
+    template = _default_shareholders_table()
+    waterfall = _align_table_to_template(shareholders_df, template).copy()
+    waterfall["Ownership %"] = _coerce_numeric(waterfall.get("Ownership %", pd.Series(dtype=float)))
+    waterfall["Investment"] = _coerce_numeric(waterfall.get("Investment", pd.Series(dtype=float)))
+    waterfall["Seniority"] = _coerce_numeric(waterfall.get("Seniority", pd.Series(dtype=float)), default=99.0)
+    waterfall["Liquidation preference (x)"] = _coerce_numeric(
+        waterfall.get("Liquidation preference (x)", pd.Series(dtype=float))
+    )
+    waterfall["Participating preferred"] = waterfall.get(
+        "Participating preferred", pd.Series(False, index=waterfall.index)
+    ).apply(lambda value: bool(value) if isinstance(value, (bool, np.bool_)) else str(value).strip().lower() in {"1", "true", "yes", "y"})
+    waterfall["Security"] = waterfall.get("Security", pd.Series("Common", index=waterfall.index)).astype(str)
+
+    exit_value = max(float(exit_equity_value or 0.0), 0.0)
+    waterfall["Converted value"] = waterfall["Ownership %"] * exit_value
+    waterfall["Preference claim"] = waterfall["Investment"] * waterfall["Liquidation preference (x)"]
+
+    preferred_mask = waterfall["Preference claim"] > 0
+    convert_mask = preferred_mask & ~waterfall["Participating preferred"] & (
+        waterfall["Converted value"] > waterfall["Preference claim"]
+    )
+    pref_pool_mask = preferred_mask & ~convert_mask
+
+    waterfall["Decision"] = "Common"
+    waterfall.loc[pref_pool_mask, "Decision"] = "Take preference"
+    waterfall.loc[convert_mask, "Decision"] = "Convert to common"
+    waterfall.loc[waterfall["Participating preferred"] & preferred_mask, "Decision"] = (
+        "Participating preferred"
+    )
+    waterfall["Preference paid"] = 0.0
+
+    remaining_exit = exit_value
+    for seniority in sorted(waterfall.loc[pref_pool_mask, "Seniority"].unique()):
+        mask = pref_pool_mask & (waterfall["Seniority"] == seniority)
+        claim_total = float(waterfall.loc[mask, "Preference claim"].sum())
+        if claim_total <= 0 or remaining_exit <= 0:
+            continue
+        payout = min(remaining_exit, claim_total)
+        allocation = waterfall.loc[mask, "Preference claim"] / claim_total
+        waterfall.loc[mask, "Preference paid"] = payout * allocation
+        remaining_exit -= payout
+
+    common_pool_mask = ~pref_pool_mask | waterfall["Participating preferred"]
+    common_pool_ownership = float(waterfall.loc[common_pool_mask, "Ownership %"].sum())
+    waterfall["Common pool allocation"] = 0.0
+    if remaining_exit > 0 and common_pool_ownership > 0:
+        waterfall.loc[common_pool_mask, "Common pool allocation"] = (
+            remaining_exit
+            * waterfall.loc[common_pool_mask, "Ownership %"]
+            / common_pool_ownership
+        )
+
+    waterfall["Total proceeds"] = waterfall["Preference paid"] + waterfall["Common pool allocation"]
+    waterfall["MOIC"] = np.where(
+        waterfall["Investment"] > 0,
+        waterfall["Total proceeds"] / waterfall["Investment"],
+        np.nan,
+    )
+
+    columns = [
+        "Shareholder",
+        "Security",
+        "Seniority",
+        "Ownership %",
+        "Investment",
+        "Decision",
+        "Converted value",
+        "Preference claim",
+        "Preference paid",
+        "Common pool allocation",
+        "Total proceeds",
+        "MOIC",
+    ]
+    return waterfall[columns].sort_values(["Seniority", "Shareholder"]).reset_index(drop=True)
+
+
+def _build_financing_outputs(
+    valuation_result: Optional[ValuationResult],
+    model_cfg: Optional[ModelConfig],
+) -> Dict[str, pd.DataFrame]:
+    outputs = {
+        "financial_performance": pd.DataFrame(),
+        "financial_position": pd.DataFrame(),
+        "cash_flows": pd.DataFrame(),
+        "lender_metrics": pd.DataFrame(),
+        "equity_bridge": pd.DataFrame(),
+        "investor_waterfall": pd.DataFrame(),
+    }
+    if valuation_result is None or model_cfg is None:
+        return outputs
+
+    perf_df, position_df, cash_flow_df = _compute_financial_statements(
+        valuation_result.consolidated,
+        model_cfg,
+    )
+    financing_settings = _financing_settings_from_state()
+    cash_flow_df = _apply_debt_schedule(
+        cash_flow_df,
+        st.session_state.get("debt_schedule_table"),
+        float(financing_settings["interest_rate"]),
+        repayment_mode=str(financing_settings["repayment_mode"]),
+        grace_years=int(financing_settings["grace_years"]),
+        target_dscr=float(financing_settings["target_dscr"]),
+        minimum_cash_reserve=float(financing_settings["minimum_cash_reserve"]),
+    )
+    lender_metrics = _build_lender_metrics(
+        cash_flow_df,
+        model_cfg.discount_rate,
+        minimum_cash_reserve=float(financing_settings["minimum_cash_reserve"]),
+        target_dscr=float(financing_settings["target_dscr"]),
+    )
+    equity_bridge = _build_enterprise_to_equity_bridge(
+        valuation_result,
+        cash_flow_df,
+        float(st.session_state.get("planned_new_equity", 0.0)),
+    )
+    investor_waterfall = pd.DataFrame()
+    if not equity_bridge.empty:
+        post_money = float(
+            equity_bridge.loc[
+                equity_bridge["Component"] == "Post-money equity value",
+                "Amount",
+            ].iloc[0]
+        )
+        investor_waterfall = _build_investor_waterfall(
+            st.session_state.get("shareholders_table"),
+            post_money,
+        )
+
+    outputs["financial_performance"] = perf_df
+    outputs["financial_position"] = position_df
+    outputs["cash_flows"] = cash_flow_df if cash_flow_df is not None else pd.DataFrame()
+    outputs["lender_metrics"] = lender_metrics
+    outputs["equity_bridge"] = equity_bridge
+    outputs["investor_waterfall"] = investor_waterfall
+    return outputs
 
 
 def _build_chart_tables(
@@ -6473,31 +6850,83 @@ def main() -> None:
                         if (pd.to_numeric(sources_df.get("Amount", pd.Series(dtype=float)), errors="coerce") < 0).any():
                             sources_warnings.append("Sources contain negative amounts; use positive values.")
                         _render_section_warnings("Sources", sources_warnings)
-                    delta = sources_total - uses_total
-                    st.info(f"Funding gap (sources - uses): {delta:,.0f}")
+                    delta = sources_total - funding_required
+                    st.info(f"Funding gap (sources - total funding required): {delta:,.0f}")
 
             if show_uses_sources:
                 with st.expander("Debt schedule inputs", expanded=False):
+                    debt_template = _default_debt_schedule(int(first_year), int(n_years))
                     debt_table_changed = (
                         st.session_state.get("debt_schedule_first_year") != int(first_year)
                         or st.session_state.get("debt_schedule_n_years") != int(n_years)
                     )
                     if debt_table_changed or "debt_schedule_table" not in st.session_state:
-                        st.session_state["debt_schedule_table"] = _default_debt_schedule(
-                            int(first_year),
-                            int(n_years),
+                        st.session_state["debt_schedule_table"] = debt_template
+                    else:
+                        st.session_state["debt_schedule_table"] = _align_table_to_template(
+                            st.session_state.get("debt_schedule_table"),
+                            debt_template,
                         )
                     st.session_state["debt_schedule_first_year"] = int(first_year)
                     st.session_state["debt_schedule_n_years"] = int(n_years)
-                    debt_interest_rate = st.number_input(
-                        "Debt interest rate",
-                        min_value=0.0,
-                        max_value=1.0,
-                        value=float(st.session_state.get("debt_interest_rate", 0.08)),
-                        step=0.005,
-                        format="%.3f",
-                        key="debt_interest_rate",
-                    )
+                    debt_cols = st.columns(5)
+                    with debt_cols[0]:
+                        debt_interest_rate = st.number_input(
+                            "Debt interest rate",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=float(st.session_state.get("debt_interest_rate", 0.08)),
+                            step=0.005,
+                            format="%.3f",
+                            key="debt_interest_rate",
+                        )
+                    with debt_cols[1]:
+                        repayment_options = ["straight_line", "sculpted_dscr", "bullet", "manual"]
+                        current_repayment_mode = str(
+                            st.session_state.get("debt_repayment_mode", "straight_line") or "straight_line"
+                        )
+                        if current_repayment_mode not in repayment_options:
+                            current_repayment_mode = "straight_line"
+                        debt_repayment_mode = st.selectbox(
+                            "Repayment mode",
+                            options=repayment_options,
+                            format_func=lambda value: {
+                                "straight_line": "Straight-line",
+                                "sculpted_dscr": "Sculpted to DSCR",
+                                "bullet": "Bullet maturity",
+                                "manual": "Manual schedule",
+                            }.get(value, value),
+                            index=repayment_options.index(current_repayment_mode),
+                            key="debt_repayment_mode",
+                        )
+                    with debt_cols[2]:
+                        debt_grace_years = st.number_input(
+                            "Grace years",
+                            min_value=0,
+                            max_value=int(n_years),
+                            value=int(st.session_state.get("debt_grace_years", 0) or 0),
+                            step=1,
+                            key="debt_grace_years",
+                        )
+                    with debt_cols[3]:
+                        debt_target_dscr = st.number_input(
+                            "Target DSCR",
+                            min_value=0.5,
+                            max_value=5.0,
+                            value=float(st.session_state.get("debt_target_dscr", 1.3) or 1.3),
+                            step=0.05,
+                            format="%.2f",
+                            key="debt_target_dscr",
+                        )
+                    with debt_cols[4]:
+                        minimum_cash_reserve = st.number_input(
+                            "Minimum cash reserve",
+                            min_value=0.0,
+                            value=float(st.session_state.get("minimum_cash_reserve", 0.0) or 0.0),
+                            step=1_000_000.0,
+                            format="%0.0f",
+                            key="minimum_cash_reserve",
+                        )
                     debt_schedule_df = _render_product_assumption_table(
                         session_key="debt_schedule_table",
                         default_factory=lambda: _default_debt_schedule(int(first_year), int(n_years)),
@@ -6513,26 +6942,52 @@ def main() -> None:
                             "Debt drawdowns": st.column_config.NumberColumn(
                                 "Debt drawdowns", step=1_000_000.0
                             ),
+                            "Manual debt repayments": st.column_config.NumberColumn(
+                                "Manual debt repayments",
+                                step=1_000_000.0,
+                            ),
                         },
                     )
                     st.session_state["debt_schedule_table"] = debt_schedule_df
-                    st.caption("Edit debt drawdowns; repayments and interest are calculated from the rate.")
+                    st.caption(
+                        "Drawdowns stay manual. Repayments follow the selected mode; the manual repayment column is used only when Manual schedule is selected."
+                    )
                     debt_warnings = []
                     if (pd.to_numeric(debt_schedule_df.get("Debt drawdowns", pd.Series(dtype=float)), errors="coerce") < 0).any():
                         debt_warnings.append("Debt drawdowns should be zero or positive.")
+                    if (
+                        pd.to_numeric(
+                            debt_schedule_df.get("Manual debt repayments", pd.Series(dtype=float)),
+                            errors="coerce",
+                        )
+                        < 0
+                    ).any():
+                        debt_warnings.append("Manual debt repayments should be zero or positive.")
                     if debt_interest_rate < 0 or debt_interest_rate > 1:
                         debt_warnings.append("Debt interest rate should be between 0% and 100%.")
+                    if debt_repayment_mode == "manual" and (
+                        pd.to_numeric(
+                            debt_schedule_df.get("Manual debt repayments", pd.Series(dtype=float)),
+                            errors="coerce",
+                        )
+                        .fillna(0.0)
+                        .sum()
+                        <= 0
+                    ):
+                        debt_warnings.append("Manual repayment mode requires at least one positive manual repayment.")
                     _render_section_warnings("Debt schedule", debt_warnings)
-                    funding_gap = funding_required - uses_total
-                    st.metric("Funding required vs uses", f"{funding_gap:,.0f}")
+                    funding_gap = sources_total - funding_required
+                    st.metric("Sources less funding required", f"{funding_gap:,.0f}")
                     if abs(funding_gap) > 1.0:
-                        st.warning("Funding required does not match total uses.")
+                        st.warning("Sources and total funding required are not yet reconciled.")
                     reconciliation = pd.DataFrame(
                         [
                             {"Component": "Uses total", "Amount": uses_total},
                             {"Component": "Cash burn (FCFF < 0)", "Amount": burn_total},
                             {"Component": "Working capital draw", "Amount": wc_total},
                             {"Component": "Funding required", "Amount": funding_required},
+                            {"Component": "Total sources", "Amount": sources_total},
+                            {"Component": "Minimum cash reserve", "Amount": minimum_cash_reserve},
                         ]
                     )
                     st.dataframe(reconciliation.style.format({"Amount": "{:,.0f}"}))
@@ -6598,6 +7053,12 @@ def main() -> None:
                 )
 
             with st.expander("Shareholders / Investors"):
+                shareholder_template = _default_shareholders_table()
+                if "shareholders_table" in st.session_state:
+                    st.session_state["shareholders_table"] = _align_table_to_template(
+                        st.session_state.get("shareholders_table"),
+                        shareholder_template,
+                    )
                 shareholders_df = _render_product_assumption_table(
                     session_key="shareholders_table",
                     default_factory=_default_shareholders_table,
@@ -6605,10 +7066,23 @@ def main() -> None:
                     id_column=None,
                     name_column="Shareholder",
                     column_config={
+                        "Security": st.column_config.SelectboxColumn(
+                            "Security",
+                            options=["Common", "Preferred", "Convertible note"],
+                        ),
+                        "Seniority": st.column_config.NumberColumn("Seniority", min_value=1, step=1),
                         "Ownership %": st.column_config.NumberColumn(
                             "Ownership %", min_value=0.0, max_value=1.0, step=0.01
                         ),
                         "Investment": st.column_config.NumberColumn("Investment", step=1_000_000.0),
+                        "Liquidation preference (x)": st.column_config.NumberColumn(
+                            "Liquidation preference (x)",
+                            min_value=0.0,
+                            step=0.1,
+                        ),
+                        "Participating preferred": st.column_config.CheckboxColumn(
+                            "Participating preferred"
+                        ),
                     },
                 )
                 investment = pd.to_numeric(
@@ -6622,11 +7096,19 @@ def main() -> None:
                     new_equity_mask = trimmed == "new equity round"
                     if new_equity_mask.any():
                         shareholders_df.loc[new_equity_mask, "Investment"] = planned_new_equity
+                        shareholders_df.loc[new_equity_mask, "Security"] = "Preferred"
+                        shareholders_df.loc[new_equity_mask, "Seniority"] = 1
+                        shareholders_df.loc[new_equity_mask, "Liquidation preference (x)"] = 1.0
+                        shareholders_df.loc[new_equity_mask, "Participating preferred"] = False
                     elif planned_new_equity > 0:
                         shareholders_df.loc[len(shareholders_df)] = {
                             "Shareholder": "New equity round",
+                            "Security": "Preferred",
+                            "Seniority": 1,
                             "Ownership %": planned_new_equity / post_money,
                             "Investment": planned_new_equity,
+                            "Liquidation preference (x)": 1.0,
+                            "Participating preferred": False,
                         }
 
                 ownership = pd.to_numeric(
@@ -6637,10 +7119,16 @@ def main() -> None:
                 st.metric("Total ownership (post-money)", f"{shareholders_df['Ownership %'].sum():.0%}")
                 st.dataframe(
                     shareholders_df.style.format(
-                        {"Ownership %": "{:.1%}", "Investment": "{:,.0f}"}
+                        {
+                            "Ownership %": "{:.1%}",
+                            "Investment": "{:,.0f}",
+                            "Liquidation preference (x)": "{:.1f}",
+                        }
                     )
                 )
-                st.caption("Diluted equity values are shown after the valuation run in the EV-to-equity bridge.")
+                st.caption(
+                    "Diluted ownership is recalculated from invested capital and planned new equity; liquidation preference and seniority feed the exit waterfall after a run."
+                )
 
             if show_relevant_market_sizes:
                 with st.expander("Relevant market sizes"):
@@ -7285,38 +7773,41 @@ def main() -> None:
                 st.success(
                     f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
                 )
-                _, _, bridge_cash_flow = _compute_financial_statements(valuation_result.consolidated, model_cfg)
-                bridge_cash_flow = _apply_debt_schedule(
-                    bridge_cash_flow,
-                    st.session_state.get("debt_schedule_table"),
-                    float(st.session_state.get("debt_interest_rate", 0.0)),
-                )
-                equity_bridge = _build_enterprise_to_equity_bridge(
-                    valuation_result,
-                    bridge_cash_flow,
-                    float(st.session_state.get("planned_new_equity", 0.0)),
-                )
+                financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
+                equity_bridge = financing_outputs["equity_bridge"]
+                lender_metrics = financing_outputs["lender_metrics"]
+                investor_waterfall = financing_outputs["investor_waterfall"]
                 st.markdown("**Enterprise-to-equity bridge**")
                 st.dataframe(equity_bridge.style.format({"Amount": "{:,.0f}"}), use_container_width=True)
-                shareholders_df = st.session_state.get("shareholders_table")
-                if isinstance(shareholders_df, pd.DataFrame) and not shareholders_df.empty:
-                    ownership_df = shareholders_df.copy()
-                    post_money_equity_value = float(
-                        equity_bridge.loc[
-                            equity_bridge["Component"] == "Post-money equity value",
-                            "Amount",
-                        ].iloc[0]
-                    )
-                    ownership_df["Diluted equity value"] = (
-                        pd.to_numeric(ownership_df.get("Ownership %", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-                        * post_money_equity_value
-                    )
+                if not lender_metrics.empty:
+                    st.markdown("**Lender metrics**")
                     st.dataframe(
-                        ownership_df.style.format(
+                        lender_metrics.style.format(
+                            {
+                                "CFADS": "{:,.0f}",
+                                "Debt service": "{:,.0f}",
+                                "DSCR": "{:.2f}",
+                                "LLCR": "{:.2f}",
+                                "PLCR": "{:.2f}",
+                                "Minimum cash reserve": "{:,.0f}",
+                                "Cash reserve headroom": "{:,.0f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
+                if not investor_waterfall.empty:
+                    st.markdown("**Investor waterfall**")
+                    st.dataframe(
+                        investor_waterfall.style.format(
                             {
                                 "Ownership %": "{:.1%}",
                                 "Investment": "{:,.0f}",
-                                "Diluted equity value": "{:,.0f}",
+                                "Converted value": "{:,.0f}",
+                                "Preference claim": "{:,.0f}",
+                                "Preference paid": "{:,.0f}",
+                                "Common pool allocation": "{:,.0f}",
+                                "Total proceeds": "{:,.0f}",
+                                "MOIC": "{:.2f}",
                             }
                         ),
                         use_container_width=True,
@@ -7328,6 +7819,12 @@ def main() -> None:
             st.info("Run the model configuration tab to populate the statements.")
         else:
             cons = valuation_result.consolidated
+            financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
+            perf_df = financing_outputs["financial_performance"]
+            position_df = financing_outputs["financial_position"]
+            cash_flow_df = financing_outputs["cash_flows"]
+            lender_metrics = financing_outputs["lender_metrics"]
+            investor_waterfall = financing_outputs["investor_waterfall"]
             with st.expander("Consolidated forecast", expanded=True):
                 cons_display = cons[["revenue", "ebitda", "fcff_after_wc"]].copy()
                 cons_display.columns = ["Revenue", "EBITDA", "FCFF after WC"]
@@ -7341,12 +7838,6 @@ def main() -> None:
                     )
                 )
                 st.line_chart(cons_display)
-            perf_df, position_df, cash_flow_df = _compute_financial_statements(cons, model_cfg)
-            cash_flow_df = _apply_debt_schedule(
-                cash_flow_df,
-                st.session_state.get("debt_schedule_table"),
-                float(st.session_state.get("debt_interest_rate", 0.0)),
-            )
             st.markdown("**Statement of Financial Performance**")
             st.dataframe(
                 perf_df.style.format({col: "{:.0f}" for col in perf_df.columns})
@@ -7361,14 +7852,15 @@ def main() -> None:
             )
             debt_draw = cash_flow_df.get("Debt drawdowns")
             debt_repay = cash_flow_df.get("Debt repayments")
+            debt_open = cash_flow_df.get("Debt opening balance")
+            debt_close = cash_flow_df.get("Debt closing balance")
             if debt_draw is not None and debt_repay is not None:
-                debt_balance = (debt_draw.fillna(0.0) - debt_repay.fillna(0.0)).cumsum()
                 debt_schedule = pd.DataFrame(
                     {
-                        "Beginning balance": debt_balance.shift(1).fillna(0.0),
+                        "Beginning balance": debt_open.fillna(0.0) if debt_open is not None else 0.0,
                         "Debt drawdowns": debt_draw.fillna(0.0),
                         "Debt repayments": debt_repay.fillna(0.0),
-                        "Ending balance": debt_balance,
+                        "Ending balance": debt_close.fillna(0.0) if debt_close is not None else 0.0,
                     },
                     index=cash_flow_df.index,
                 )
@@ -7378,6 +7870,39 @@ def main() -> None:
                 )
             else:
                 st.info("Debt schedule unavailable: cash flow inputs are missing debt columns.")
+            if not lender_metrics.empty:
+                st.markdown("**Lender metrics**")
+                st.dataframe(
+                    lender_metrics.style.format(
+                        {
+                            "CFADS": "{:,.0f}",
+                            "Debt service": "{:,.0f}",
+                            "DSCR": "{:.2f}",
+                            "LLCR": "{:.2f}",
+                            "PLCR": "{:.2f}",
+                            "Minimum cash reserve": "{:,.0f}",
+                            "Cash reserve headroom": "{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+            if not investor_waterfall.empty:
+                st.markdown("**Investor waterfall**")
+                st.dataframe(
+                    investor_waterfall.style.format(
+                        {
+                            "Ownership %": "{:.1%}",
+                            "Investment": "{:,.0f}",
+                            "Converted value": "{:,.0f}",
+                            "Preference claim": "{:,.0f}",
+                            "Preference paid": "{:,.0f}",
+                            "Common pool allocation": "{:,.0f}",
+                            "Total proceeds": "{:,.0f}",
+                            "MOIC": "{:.2f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
             st.markdown("**Excel Model Download**")
             excel_bytes = st.session_state.get("financial_excel_bytes")
             download_container = st.container()
@@ -7391,6 +7916,8 @@ def main() -> None:
                                 position_df,
                                 cash_flow_df,
                                 model_cfg,
+                                lender_metrics=lender_metrics,
+                                investor_waterfall=investor_waterfall,
                             )
                         st.session_state["financial_excel_bytes"] = excel_bytes
                 if excel_bytes:
@@ -8230,6 +8757,16 @@ _BIOTECH_SCALAR_KEYS = [
     "scenario_prob_mult",
     "vaccine_sales_first_year",
     "vaccine_sales_n_years",
+    "debt_interest_rate",
+    "debt_repayment_mode",
+    "debt_grace_years",
+    "debt_target_dscr",
+    "minimum_cash_reserve",
+    "funding_required",
+    "planned_new_equity",
+    "opening_nol_balance",
+    "debt_schedule_first_year",
+    "debt_schedule_n_years",
 ]
 
 

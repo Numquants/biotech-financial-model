@@ -18,6 +18,7 @@ from .core import (
     MonteCarloEngine,
     ForecastEngine,
     ForecastScenarioBridge,
+    validate_model_config,
     validate_product_config,
     validate_portfolio,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "MonteCarloEngine",
     "ForecastEngine",
     "ForecastScenarioBridge",
+    "validate_model_config",
     "validate_product_config",
     "validate_portfolio",
 ]

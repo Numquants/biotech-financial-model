@@ -1,9 +1,15 @@
 import unittest
+from io import BytesIO
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from streamlit_app import (
+    _apply_debt_schedule,
+    _build_financial_excel,
     _build_enterprise_to_equity_bridge,
+    _build_investor_waterfall,
+    _build_lender_metrics,
     _build_portfolio,
     _build_probability_preview,
     _default_stage_schedule_mapping,
@@ -153,6 +159,122 @@ class StreamlitHelperTests(unittest.TestCase):
             valuation_result.consolidated.loc[milestone_year, "milestones"],
             expected_weighted_milestone,
         )
+
+    def test_debt_schedule_builds_bullet_profile_and_lender_metrics(self) -> None:
+        cash_flow_df = pd.DataFrame(
+            {
+                "Net cash from operations": [80.0, 90.0, 100.0],
+                "Net cash from investing": [-10.0, -10.0, -10.0],
+                "Equity issuance": [0.0, 0.0, 0.0],
+                "Net cash from financing": [0.0, 0.0, 0.0],
+                "Net change in cash": [70.0, 80.0, 90.0],
+                "Beginning cash balance": [0.0, 0.0, 0.0],
+                "Ending cash balance": [70.0, 150.0, 240.0],
+            },
+            index=[2024, 2025, 2026],
+        )
+        debt_schedule = pd.DataFrame(
+            {
+                "Year": [2024, 2025, 2026],
+                "Debt drawdowns": [120.0, 0.0, 0.0],
+                "Manual debt repayments": [0.0, 0.0, 0.0],
+            }
+        )
+
+        updated = _apply_debt_schedule(
+            cash_flow_df,
+            debt_schedule,
+            interest_rate=0.10,
+            repayment_mode="bullet",
+            grace_years=1,
+            minimum_cash_reserve=5.0,
+        )
+        self.assertEqual(updated.loc[2024, "Debt repayments"], 0.0)
+        self.assertEqual(updated.loc[2025, "Debt repayments"], 0.0)
+        self.assertEqual(updated.loc[2026, "Debt repayments"], 120.0)
+        self.assertEqual(updated.loc[2025, "Beginning cash balance"], updated.loc[2024, "Ending cash balance"])
+
+        metrics = _build_lender_metrics(
+            updated,
+            discount_rate=0.10,
+            minimum_cash_reserve=5.0,
+            target_dscr=1.2,
+        )
+        self.assertAlmostEqual(metrics.loc[2025, "DSCR"], 80.0 / 12.0)
+        self.assertAlmostEqual(metrics.loc[2026, "Debt service"], 132.0)
+        self.assertEqual(metrics.loc[2025, "Covenant status"], "Pass")
+
+    def test_investor_waterfall_applies_preference_before_common(self) -> None:
+        shareholders_df = pd.DataFrame(
+            [
+                {
+                    "Shareholder": "Founders",
+                    "Security": "Common",
+                    "Seniority": 3,
+                    "Ownership %": 0.5,
+                    "Investment": 20.0,
+                    "Liquidation preference (x)": 0.0,
+                    "Participating preferred": False,
+                },
+                {
+                    "Shareholder": "Series A",
+                    "Security": "Preferred",
+                    "Seniority": 1,
+                    "Ownership %": 0.5,
+                    "Investment": 40.0,
+                    "Liquidation preference (x)": 1.0,
+                    "Participating preferred": False,
+                },
+            ]
+        )
+
+        waterfall = _build_investor_waterfall(shareholders_df, exit_equity_value=60.0).set_index("Shareholder")
+        self.assertEqual(waterfall.loc["Series A", "Decision"], "Take preference")
+        self.assertEqual(waterfall.loc["Series A", "Preference paid"], 40.0)
+        self.assertEqual(waterfall.loc["Founders", "Total proceeds"], 20.0)
+
+    def test_financial_excel_includes_debt_and_waterfall_sheets(self) -> None:
+        cons = pd.DataFrame(
+            {
+                "revenue": [100.0],
+                "cogs": [-40.0],
+                "ebitda": [20.0],
+                "nopat": [12.0],
+                "rd_cash": [-5.0],
+                "capex_cash": [-3.0],
+                "fcff_after_wc": [10.0],
+            },
+            index=[2024],
+        )
+        perf_df = pd.DataFrame({"Revenue": [100.0]}, index=[2024])
+        position_df = pd.DataFrame({"Total equity": [50.0]}, index=[2024])
+        cash_flow_df = pd.DataFrame({"Net change in cash": [10.0]}, index=[2024])
+        lender_metrics = pd.DataFrame(
+            {"CFADS": [10.0], "Debt service": [5.0], "DSCR": [2.0]},
+            index=[2024],
+        )
+        investor_waterfall = pd.DataFrame(
+            {
+                "Shareholder": ["Founders"],
+                "Total proceeds": [25.0],
+            }
+        )
+
+        workbook = load_workbook(
+            BytesIO(
+                _build_financial_excel(
+                    cons,
+                    perf_df,
+                    position_df,
+                    cash_flow_df,
+                    ModelConfig(first_year=2024, n_years=1),
+                    lender_metrics=lender_metrics,
+                    investor_waterfall=investor_waterfall,
+                )
+            )
+        )
+        self.assertIn("Debt metrics", workbook.sheetnames)
+        self.assertIn("Investor waterfall", workbook.sheetnames)
 
 
 if __name__ == "__main__":

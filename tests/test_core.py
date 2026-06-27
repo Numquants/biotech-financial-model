@@ -12,6 +12,7 @@ from valuation_codex_package.core import (
     Scenario,
     ScenarioEngine,
     MonteCarloEngine,
+    validate_portfolio,
     validate_product_config,
 )
 
@@ -141,6 +142,60 @@ class CoreModelTests(unittest.TestCase):
         self.assertIn("overhead_pct must be between 0 and 1", joined)
         self.assertIn("royalty_pct must be between 0 and 1", joined)
         self.assertIn("post_patent_erosion values must be between 0 and 1", joined)
+
+    def test_validate_product_config_rejects_inconsistent_stage_and_revenue_inputs(self) -> None:
+        issues = validate_product_config(
+            ProductConfig(
+                name="InconsistentAsset",
+                stage="Phase II",
+                success_prob=0.4,
+                include_in_consolidation=True,
+                time_to_market=3,
+                patent_years=10,
+                patent_revenue_target=100.0,
+                post_patent_revenue_target=50.0,
+                patient_population_patent=2.0,
+                price_per_patient_patent=40.0,
+                penetration_patent=1.0,
+                stage_duration_years={"Phase II": 1, "Phase III": 1, "Approval": 0},
+                stage_cost_weights={"Phase II": 0.7, "Phase III": 0.6},
+                stage_capex_weights={"Phase II": 0.6, "Phase III": 0.6},
+            )
+        )
+        joined = " | ".join(issues)
+        self.assertIn("patient-based patent-period revenue does not reconcile", joined)
+        self.assertIn("stage durations from Phase II to launch must sum to time_to_market", joined)
+        self.assertIn("stage cost weights across active pre-launch stages must sum to 1.0", joined)
+        self.assertIn("stage capex weights across active pre-launch stages must sum to 1.0", joined)
+
+    def test_validate_portfolio_rejects_out_of_range_model_assumptions(self) -> None:
+        model_cfg = ModelConfig(
+            first_year=2024,
+            n_years=5,
+            tax_rate=0.8,
+            discount_rate=0.04,
+            ev_ebitda_multiple=35.0,
+            working_capital_pct_sales=1.2,
+            terminal_method="perpetuity_growth",
+            perpetuity_growth_rate=0.05,
+        )
+        product_cfg = ProductConfig(
+            name="ModelIssue",
+            stage="Commercial",
+            success_prob=1.0,
+            include_in_consolidation=True,
+            preexisting_market=True,
+            time_to_market=0,
+            patent_years=5,
+            patent_revenue_target=100.0,
+            post_patent_revenue_target=50.0,
+        )
+        issues = validate_portfolio(Portfolio([Product(product_cfg, model_cfg)], model_cfg))
+        joined = " | ".join(issues)
+        self.assertIn("ModelConfig: tax_rate must be between 0 and 0.6", joined)
+        self.assertIn("ModelConfig: ev_ebitda_multiple must be between 0 and 30", joined)
+        self.assertIn("ModelConfig: working_capital_pct_sales must be between 0 and 1", joined)
+        self.assertIn("ModelConfig: perpetuity_growth_rate must be lower than discount_rate", joined)
 
     def test_opening_nol_shields_consolidated_tax(self) -> None:
         model_cfg = ModelConfig(

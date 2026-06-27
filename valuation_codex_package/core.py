@@ -1325,9 +1325,65 @@ __all__ = [
     "MonteCarloEngine",
     "ForecastEngine",
     "ForecastScenarioBridge",
+    "validate_model_config",
     "validate_product_config",
     "validate_portfolio",
 ]
+
+
+def validate_model_config(config: ModelConfig) -> List[str]:
+    issues: List[str] = []
+    if config.n_years <= 0:
+        issues.append("ModelConfig: n_years must be positive.")
+    if not (0.0 <= config.tax_rate <= 0.6):
+        issues.append("ModelConfig: tax_rate must be between 0 and 0.6.")
+    if not (0.0 <= config.discount_rate <= 0.6):
+        issues.append("ModelConfig: discount_rate must be between 0 and 0.6.")
+    if not (0.0 <= config.working_capital_pct_sales <= 1.0):
+        issues.append("ModelConfig: working_capital_pct_sales must be between 0 and 1.")
+    if not (0.0 <= config.ev_ebitda_multiple <= 30.0):
+        issues.append("ModelConfig: ev_ebitda_multiple must be between 0 and 30.")
+    if config.opening_nol_balance < 0:
+        issues.append("ModelConfig: opening_nol_balance cannot be negative.")
+    if config.terminal_method not in {"exit_multiple", "perpetuity_growth"}:
+        issues.append("ModelConfig: terminal_method must be exit_multiple or perpetuity_growth.")
+    if config.terminal_method == "perpetuity_growth":
+        if not (-0.05 <= config.perpetuity_growth_rate <= 0.06):
+            issues.append("ModelConfig: perpetuity_growth_rate must be between -5% and 6%.")
+        if config.perpetuity_growth_rate >= config.discount_rate:
+            issues.append("ModelConfig: perpetuity_growth_rate must be lower than discount_rate.")
+    if config.discount_timing not in {"year_end", "mid_year", "year_0"}:
+        issues.append("ModelConfig: discount_timing must be year_end, mid_year, or year_0.")
+    for factor in config.sales_ramp_factors or []:
+        if factor < 0 or factor > 2.0:
+            issues.append("ModelConfig: sales_ramp_factors must stay between 0 and 2.")
+            break
+    return issues
+
+
+def _validate_patient_target_block(
+    config: ProductConfig,
+    *,
+    label: str,
+    revenue_target: float,
+    population: float,
+    price: float,
+    penetration: float,
+) -> List[str]:
+    issues: List[str] = []
+    provided = [population > 0, price > 0, penetration > 0]
+    if any(provided) and not all(provided):
+        issues.append(
+            f"{config.name}: patient-based {label} assumptions must include population, price, and penetration together."
+        )
+    if all(provided) and revenue_target > 0:
+        implied_revenue = float(population) * float(price) * float(penetration)
+        baseline = max(abs(implied_revenue), abs(float(revenue_target)), 1.0)
+        if abs(implied_revenue - float(revenue_target)) / baseline > 0.10:
+            issues.append(
+                f"{config.name}: patient-based {label} revenue does not reconcile to the direct revenue target within 10%."
+            )
+    return issues
 
 
 def validate_product_config(config: ProductConfig) -> List[str]:
@@ -1452,11 +1508,53 @@ def validate_product_config(config: ProductConfig) -> List[str]:
             issues.append(
                 f"{config.name}: milestone '{milestone.name}' timing must be 'from_start' or 'from_launch'."
             )
+    issues.extend(
+        _validate_patient_target_block(
+            config,
+            label="patent-period",
+            revenue_target=config.patent_revenue_target,
+            population=config.patient_population_patent,
+            price=config.price_per_patient_patent,
+            penetration=config.penetration_patent,
+        )
+    )
+    issues.extend(
+        _validate_patient_target_block(
+            config,
+            label="post-patent",
+            revenue_target=config.post_patent_revenue_target,
+            population=config.patient_population_post,
+            price=config.price_per_patient_post,
+            penetration=config.penetration_post,
+        )
+    )
+    if config.stage in STAGE_SEQUENCE and config.stage_duration_years and not config.preexisting_market:
+        stage_idx = STAGE_SEQUENCE.index(config.stage)
+        forward_stages = STAGE_SEQUENCE[stage_idx:-1]
+        duration_sum = sum(int(config.stage_duration_years.get(stage, 0)) for stage in forward_stages)
+        if duration_sum > 0 and duration_sum != int(max(config.time_to_market, 0)):
+            issues.append(
+                f"{config.name}: stage durations from {config.stage} to launch must sum to time_to_market."
+            )
+
+        active_weight_stages = [stage for stage in forward_stages if int(config.stage_duration_years.get(stage, 0)) > 0]
+        if active_weight_stages and config.stage_cost_weights:
+            cost_weight_total = sum(float(config.stage_cost_weights.get(stage, 0.0)) for stage in active_weight_stages)
+            if not np.isclose(cost_weight_total, 1.0, atol=0.05):
+                issues.append(
+                    f"{config.name}: stage cost weights across active pre-launch stages must sum to 1.0."
+                )
+        if active_weight_stages and config.stage_capex_weights:
+            capex_weight_total = sum(float(config.stage_capex_weights.get(stage, 0.0)) for stage in active_weight_stages)
+            if not np.isclose(capex_weight_total, 1.0, atol=0.05):
+                issues.append(
+                    f"{config.name}: stage capex weights across active pre-launch stages must sum to 1.0."
+                )
     return issues
 
 
 def validate_portfolio(portfolio: Portfolio) -> List[str]:
-    issues: List[str] = []
+    issues: List[str] = validate_model_config(portfolio.model_config)
     for product in portfolio.products:
         issues.extend(validate_product_config(product.config))
     return issues
