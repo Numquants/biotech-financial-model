@@ -2161,17 +2161,14 @@ def _stage_milestones_from_row(
         amount = row.get(col)
         if pd.isna(amount) or float(amount) == 0.0:
             continue
-        transition_key = None
-        if stage != "Commercial":
-            next_idx = STAGE_SEQUENCE.index(stage) + 1
-            if next_idx < len(STAGE_SEQUENCE):
-                transition_key = f"{stage}->{STAGE_SEQUENCE[next_idx]}"
-        probability = transitions.get(transition_key, 1.0) if transition_key else 1.0
         milestone = Milestone(
             name=f"{stage} completion milestone",
             year_offset=cumulative_years,
             amount=float(amount),
-            probability=float(probability),
+            # Stage-transition schedules already risk-adjust the product cash flows
+            # over time, so generated milestones should not embed the same
+            # transition probability a second time.
+            probability=1.0,
             timing="from_start",
         )
         milestones.append(milestone)
