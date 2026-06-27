@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
+from enum import Enum
+import re
 from typing import List, Dict, Optional, Callable, Iterable
 
 import numpy as np
@@ -96,6 +98,17 @@ class ProductConfig:
     post_patent_erosion: List[float] = field(default_factory=lambda: [1.0, 0.85, 0.7, 0.55, 0.4])
     milestones: List["Milestone"] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.stage = normalize_stage_label(self.stage)
+        self.stage_duration_years = _normalize_stage_value_map(self.stage_duration_years)
+        self.stage_cost_weights = _normalize_stage_value_map(self.stage_cost_weights)
+        self.stage_capex_weights = _normalize_stage_value_map(self.stage_capex_weights)
+        self.trial_costs_by_phase = _normalize_stage_value_map(self.trial_costs_by_phase)
+        self.stage_transition_probabilities = _normalize_transition_value_map(
+            self.stage_transition_probabilities
+        )
+        self.stage_transition_curve = _normalize_transition_value_map(self.stage_transition_curve)
+
 
 @dataclass
 class Milestone:
@@ -106,15 +119,82 @@ class Milestone:
     timing: str = "from_launch"
 
 
-STAGE_SEQUENCE = [
-    "Discovery",
-    "Preclinical",
-    "Phase I",
-    "Phase II",
-    "Phase III",
-    "Approval",
-    "Commercial",
-]
+class Stage(str, Enum):
+    DISCOVERY = "Discovery"
+    PRECLINICAL = "Preclinical"
+    PHASE_I = "Phase I"
+    PHASE_II = "Phase II"
+    PHASE_III = "Phase III"
+    APPROVAL = "Approval"
+    COMMERCIAL = "Commercial"
+
+
+STAGE_SEQUENCE = [stage.value for stage in Stage]
+_STAGE_TRANSITIONS = {
+    f"{from_stage}->{to_stage}"
+    for from_stage, to_stage in zip(STAGE_SEQUENCE[:-1], STAGE_SEQUENCE[1:])
+}
+
+
+def _normalize_stage_token(value: object) -> str:
+    return re.sub(r"[\s_-]+", " ", str(value or "").strip()).casefold()
+
+
+_STAGE_ALIASES = {
+    "discovery": Stage.DISCOVERY.value,
+    "pre clinical": Stage.PRECLINICAL.value,
+    "preclinic": Stage.PRECLINICAL.value,
+    "phase 1": Stage.PHASE_I.value,
+    "phase 2": Stage.PHASE_II.value,
+    "phase 3": Stage.PHASE_III.value,
+    "filing": Stage.APPROVAL.value,
+    "filed": Stage.APPROVAL.value,
+    "registration": Stage.APPROVAL.value,
+    "nda filing": Stage.APPROVAL.value,
+    "bla filing": Stage.APPROVAL.value,
+    "market": Stage.COMMERCIAL.value,
+    "marketed": Stage.COMMERCIAL.value,
+    "launch": Stage.COMMERCIAL.value,
+    "launched": Stage.COMMERCIAL.value,
+}
+_CANONICAL_STAGES = {_normalize_stage_token(stage): stage for stage in STAGE_SEQUENCE}
+
+
+def normalize_stage_label(value: str | Stage | None) -> str:
+    token = _normalize_stage_token(value)
+    if not token:
+        return ""
+    return _STAGE_ALIASES.get(token, _CANONICAL_STAGES.get(token, str(value).strip()))
+
+
+def _normalize_transition_key(key: object) -> str:
+    raw = str(key or "").strip()
+    if "->" not in raw:
+        return raw
+    left, right = raw.split("->", 1)
+    left_stage = normalize_stage_label(left)
+    right_stage = normalize_stage_label(right)
+    if not left_stage or not right_stage:
+        return raw
+    return f"{left_stage}->{right_stage}"
+
+
+def _normalize_stage_value_map(mapping: Optional[Dict[str, object]]) -> Dict[str, object]:
+    normalized: Dict[str, object] = {}
+    for key, value in (mapping or {}).items():
+        stage = normalize_stage_label(key)
+        if stage:
+            normalized[stage] = value
+    return normalized
+
+
+def _normalize_transition_value_map(mapping: Optional[Dict[str, object]]) -> Dict[str, object]:
+    normalized: Dict[str, object] = {}
+    for key, value in (mapping or {}).items():
+        transition = _normalize_transition_key(key)
+        if transition:
+            normalized[transition] = value
+    return normalized
 
 
 def _scale_product_config(
@@ -160,7 +240,7 @@ def _apply_stage_slippage(config: ProductConfig, slippage: Dict[str, int]) -> Pr
     cfg_dict = asdict(config)
     stage_durations = cfg_dict.get("stage_duration_years") or {}
     updated_durations = dict(stage_durations) if stage_durations else {}
-    for stage, years in slippage.items():
+    for stage, years in _normalize_stage_value_map(slippage).items():
         try:
             delay = int(years)
         except (TypeError, ValueError):
@@ -207,7 +287,9 @@ class Product:
     def probability_source(self) -> str:
         cfg = self.config
         if cfg.stage_transition_curve or cfg.stage_transition_probabilities:
-            return "stage_transitions"
+            if cfg.stage in STAGE_SEQUENCE:
+                return "stage_transitions"
+            return "success_prob_stage_fallback"
         return "success_prob"
 
     def effective_success_probability(self) -> float:
@@ -598,7 +680,8 @@ class Product:
             else:
                 milestone_year = self.model_config.first_year + milestone.year_offset
             if milestone_year in df.index:
-                df.loc[milestone_year, "milestones"] += milestone.amount
+                weighted_amount = float(milestone.amount) * float(milestone.probability)
+                df.loc[milestone_year, "milestones"] += weighted_amount
         df["ebit"] = df["ebit"] + df["milestones"]
         df["da"] = -(df["rd_amort"] + df["depreciation"])
         df["ebitda"] = df["ebit"] + df["da"]
@@ -1228,7 +1311,9 @@ __all__ = [
     "ModelConfig",
     "ProductConfig",
     "Milestone",
+    "Stage",
     "STAGE_SEQUENCE",
+    "normalize_stage_label",
     "Product",
     "Portfolio",
     "ValuationEngine",
@@ -1247,6 +1332,10 @@ __all__ = [
 
 def validate_product_config(config: ProductConfig) -> List[str]:
     issues: List[str] = []
+    if config.stage not in STAGE_SEQUENCE:
+        issues.append(
+            f"{config.name}: stage must be one of {', '.join(STAGE_SEQUENCE)}."
+        )
     if not (0.0 <= config.success_prob <= 1.0):
         issues.append(f"{config.name}: success_prob must be between 0 and 1.")
     if config.stage == "Commercial" and config.time_to_market > 0:
@@ -1255,6 +1344,8 @@ def validate_product_config(config: ProductConfig) -> List[str]:
         issues.append(f"{config.name}: patent_years must be positive.")
     if config.time_to_market < 0 and not config.preexisting_market:
         issues.append(f"{config.name}: time_to_market must be >= 0 for non-preexisting products.")
+    if config.sales_ramp_length is not None and config.sales_ramp_length < 0:
+        issues.append(f"{config.name}: sales_ramp_length must be >= 0.")
     if config.sales_ramp_shape and config.sales_ramp_shape not in {"Linear", "S-curve", "Step"}:
         issues.append(f"{config.name}: sales_ramp_shape must be Linear, S-curve, or Step.")
     if config.launch_delay_sigma_years < 0:
@@ -1262,14 +1353,35 @@ def validate_product_config(config: ProductConfig) -> List[str]:
     if config.upfront_timing not in {"from_start", "from_launch"}:
         issues.append(f"{config.name}: upfront_timing must be 'from_start' or 'from_launch'.")
     for label, value in {
+        "cogs_patent": config.cogs_patent,
+        "cogs_post": config.cogs_post,
+        "labor_pct": config.labor_pct,
+        "overhead_pct": config.overhead_pct,
+        "material_pct": config.material_pct,
+        "sales_marketing_pct": config.sales_marketing_pct,
+        "gna_pct": config.gna_pct,
+        "royalty_pct": config.royalty_pct,
+        "rd_capitalization_ratio": config.rd_capitalization_ratio,
+    }.items():
+        if not (0.0 <= value <= 1.0):
+            issues.append(f"{config.name}: {label} must be between 0 and 1.")
+    for label, value in {
         "rd_remaining_pre_launch": config.rd_remaining_pre_launch,
         "rd_annual_post_launch": config.rd_annual_post_launch,
         "capex_remaining_pre_launch": config.capex_remaining_pre_launch,
         "capex_annual_post_launch": config.capex_annual_post_launch,
         "upfront_payment": config.upfront_payment,
+        "patent_revenue_target": config.patent_revenue_target,
+        "post_patent_revenue_target": config.post_patent_revenue_target,
     }.items():
         if value < 0:
             issues.append(f"{config.name}: {label} cannot be negative.")
+    for label, value in {
+        "rd_amort_years": config.rd_amort_years,
+        "capex_dep_years": config.capex_dep_years,
+    }.items():
+        if value < 0:
+            issues.append(f"{config.name}: {label} must be >= 0.")
     for label, value in {
         "patient_population_patent": config.patient_population_patent,
         "price_per_patient_patent": config.price_per_patient_patent,
@@ -1280,30 +1392,48 @@ def validate_product_config(config: ProductConfig) -> List[str]:
     }.items():
         if value < 0:
             issues.append(f"{config.name}: {label} cannot be negative.")
+    for label, value in {
+        "market_growth_patent": config.market_growth_patent,
+        "market_growth_post": config.market_growth_post,
+    }.items():
+        if value <= -1.0:
+            issues.append(f"{config.name}: {label} must be greater than -1.")
     for key, prob in config.stage_transition_probabilities.items():
+        if key not in _STAGE_TRANSITIONS:
+            issues.append(f"{config.name}: stage transition '{key}' is not recognized.")
         if not (0.0 <= prob <= 1.0):
             issues.append(f"{config.name}: stage transition '{key}' must be between 0 and 1.")
     for stage, duration in config.stage_duration_years.items():
+        if stage not in STAGE_SEQUENCE:
+            issues.append(f"{config.name}: stage duration '{stage}' uses an unknown stage.")
         if duration < 0:
             issues.append(f"{config.name}: stage duration '{stage}' must be >= 0.")
     for stage, weight in config.stage_cost_weights.items():
+        if stage not in STAGE_SEQUENCE:
+            issues.append(f"{config.name}: stage cost weight '{stage}' uses an unknown stage.")
         if weight < 0:
             issues.append(f"{config.name}: stage cost weight '{stage}' must be >= 0.")
     for stage, weight in config.stage_capex_weights.items():
+        if stage not in STAGE_SEQUENCE:
+            issues.append(f"{config.name}: stage capex weight '{stage}' uses an unknown stage.")
         if weight < 0:
             issues.append(f"{config.name}: stage capex weight '{stage}' must be >= 0.")
     for stage, amount in config.trial_costs_by_phase.items():
+        if stage not in STAGE_SEQUENCE:
+            issues.append(f"{config.name}: trial cost '{stage}' uses an unknown stage.")
         if amount < 0:
             issues.append(f"{config.name}: trial cost '{stage}' must be >= 0.")
     for key, curve in config.stage_transition_curve.items():
+        if key not in _STAGE_TRANSITIONS:
+            issues.append(f"{config.name}: stage transition '{key}' curve is not recognized.")
         for prob in curve:
             if not (0.0 <= prob <= 1.0):
                 issues.append(
                     f"{config.name}: stage transition '{key}' curve values must be between 0 and 1."
                 )
     for factor in config.post_patent_erosion:
-        if factor < 0:
-            issues.append(f"{config.name}: post_patent_erosion values must be >= 0.")
+        if not (0.0 <= factor <= 1.0):
+            issues.append(f"{config.name}: post_patent_erosion values must be between 0 and 1.")
     normalized_milestones: List[Milestone] = []
     for milestone in config.milestones:
         if isinstance(milestone, Milestone):
@@ -1318,6 +1448,10 @@ def validate_product_config(config: ProductConfig) -> List[str]:
             issues.append(f"{config.name}: milestone '{milestone.name}' amount cannot be negative.")
         if not (0.0 <= milestone.probability <= 1.0):
             issues.append(f"{config.name}: milestone '{milestone.name}' probability must be 0-1.")
+        if milestone.timing not in {"from_start", "from_launch"}:
+            issues.append(
+                f"{config.name}: milestone '{milestone.name}' timing must be 'from_start' or 'from_launch'."
+            )
     return issues
 
 

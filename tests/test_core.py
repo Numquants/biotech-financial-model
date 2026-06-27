@@ -12,6 +12,7 @@ from valuation_codex_package.core import (
     Scenario,
     ScenarioEngine,
     MonteCarloEngine,
+    validate_product_config,
 )
 
 
@@ -93,15 +94,15 @@ class CoreModelTests(unittest.TestCase):
             milestones=[Milestone(name="approval", year_offset=0, amount=100.0, probability=0.2, timing="from_start")],
         )
         result = ValuationEngine(Portfolio([Product(product_cfg, model_cfg)], model_cfg)).run()
-        self.assertEqual(result.consolidated.loc[2024, "milestones"], 50.0)
-        self.assertEqual(result.consolidated.loc[2024, "fcff"], 50.0)
-        self.assertEqual(result.rnpv, 50.0)
+        self.assertEqual(result.consolidated.loc[2024, "milestones"], 10.0)
+        self.assertEqual(result.consolidated.loc[2024, "fcff"], 10.0)
+        self.assertEqual(result.rnpv, 10.0)
 
     def test_stage_transition_probabilities_override_success_prob(self) -> None:
         model_cfg = ModelConfig(first_year=2024, n_years=5)
         product_cfg = ProductConfig(
             name="StageDriven",
-            stage="Phase II",
+            stage="Phase 2",
             success_prob=0.9,
             include_in_consolidation=True,
             time_to_market=2,
@@ -113,8 +114,33 @@ class CoreModelTests(unittest.TestCase):
             stage_transition_curve={"Phase II->Phase III": [0.5], "Phase III->Approval": [0.5]},
         )
         product = Product(product_cfg, model_cfg)
+        self.assertEqual(product.config.stage, "Phase II")
         self.assertAlmostEqual(product.effective_success_probability(), 0.25)
         self.assertEqual(product.probability_source(), "stage_transitions")
+
+    def test_validate_product_config_rejects_impossible_operating_ratios(self) -> None:
+        issues = validate_product_config(
+            ProductConfig(
+                name="InvalidRatios",
+                stage="Commercial",
+                success_prob=1.0,
+                preexisting_market=True,
+                time_to_market=0,
+                cogs_patent=1.2,
+                cogs_post=-0.1,
+                labor_pct=1.1,
+                overhead_pct=-0.2,
+                royalty_pct=1.5,
+                post_patent_erosion=[1.0, 1.1],
+            )
+        )
+        joined = " | ".join(issues)
+        self.assertIn("cogs_patent must be between 0 and 1", joined)
+        self.assertIn("cogs_post must be between 0 and 1", joined)
+        self.assertIn("labor_pct must be between 0 and 1", joined)
+        self.assertIn("overhead_pct must be between 0 and 1", joined)
+        self.assertIn("royalty_pct must be between 0 and 1", joined)
+        self.assertIn("post_patent_erosion values must be between 0 and 1", joined)
 
     def test_opening_nol_shields_consolidated_tax(self) -> None:
         model_cfg = ModelConfig(

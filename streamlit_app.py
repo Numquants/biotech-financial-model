@@ -46,6 +46,7 @@ from valuation_codex_package import (
     Product,
     ProductConfig,
     STAGE_SEQUENCE,
+    normalize_stage_label,
     Scenario,
     ScenarioEngine,
     ForecastEngine,
@@ -412,7 +413,7 @@ def _stage_mapping_sanity_checks(mapping_df: pd.DataFrame) -> List[str]:
     if mapping_df is None or mapping_df.empty:
         return warnings
     for _, row in mapping_df.iterrows():
-        stage = str(row.get("Stage", "")).strip()
+        stage = normalize_stage_label(row.get("Stage"))
         if not stage:
             continue
         time_to_market = row.get("Time to market (years)")
@@ -2084,6 +2085,7 @@ def _stage_capex_weights_from_row(row: pd.Series) -> Dict[str, float]:
 
 
 def _compute_time_to_market_from_durations(stage: str, durations: Dict[str, int]) -> Optional[int]:
+    stage = normalize_stage_label(stage)
     if stage not in STAGE_SEQUENCE or not durations:
         return None
     stage_idx = STAGE_SEQUENCE.index(stage)
@@ -2099,7 +2101,8 @@ def _stage_mapping_row(mapping_df: pd.DataFrame, stage: str) -> Optional[pd.Seri
         return None
     if "Stage" not in mapping_df.columns:
         return None
-    matches = mapping_df[mapping_df["Stage"].astype(str) == str(stage)]
+    normalized_stage = normalize_stage_label(stage)
+    matches = mapping_df[mapping_df["Stage"].astype(str).map(normalize_stage_label) == normalized_stage]
     if matches.empty:
         return None
     return matches.iloc[0]
@@ -2168,7 +2171,7 @@ def _stage_milestones_from_row(
             name=f"{stage} completion milestone",
             year_offset=cumulative_years,
             amount=float(amount),
-            probability=1.0,
+            probability=float(probability),
             timing="from_start",
         )
         milestones.append(milestone)
@@ -2576,6 +2579,13 @@ def _build_probability_preview(
     overwrite_defaults: bool,
     detail_tables: Optional[Dict[str, pd.DataFrame]],
 ) -> pd.DataFrame:
+    def _probability_path_label(source: str) -> str:
+        if source == "stage_transitions":
+            return "Stage-transition path"
+        if source == "success_prob_stage_fallback":
+            return "Single success probability fallback"
+        return "Single success probability"
+
     rows: List[Dict[str, Any]] = []
     preview_records = _sanitize_product_records(
         product_df,
@@ -2592,11 +2602,8 @@ def _build_probability_preview(
             {
                 "Product": record.get("name"),
                 "Stage": record.get("stage"),
-                "Probability source": (
-                    "Stage-transition curve"
-                    if product.probability_source() == "stage_transitions"
-                    else "Single success probability"
-                ),
+                "Probability source": _probability_path_label(product.probability_source()),
+                "Probability path used": _probability_path_label(product.probability_source()),
                 "Input success probability": float(record.get("success_prob", 0.0) or 0.0),
                 "Effective cumulative success probability": product.effective_success_probability(),
                 "Time to market (years)": int(record.get("time_to_market", 0) or 0),
@@ -2623,7 +2630,7 @@ def _sanitize_product_records(
             if isinstance(value, float) and np.isnan(value):
                 continue
             cleaned[key] = value
-        cleaned.setdefault("stage", "Unspecified")
+        cleaned["stage"] = normalize_stage_label(cleaned.get("stage")) or "Unspecified"
         cleaned.setdefault("success_prob", 0.5)
         cleaned.setdefault("include_in_consolidation", True)
         mapping_row = _stage_mapping_row(stage_mapping, cleaned.get("stage"))

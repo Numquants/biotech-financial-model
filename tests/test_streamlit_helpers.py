@@ -45,7 +45,7 @@ class StreamlitHelperTests(unittest.TestCase):
             [
                 {
                     "name": "AgSeed-101",
-                    "stage": "Phase II",
+                    "stage": "Phase 2",
                     "success_prob": 0.35,
                     "include_in_consolidation": True,
                     "time_to_market": 4,
@@ -62,8 +62,35 @@ class StreamlitHelperTests(unittest.TestCase):
             overwrite_defaults=False,
             detail_tables={},
         )
-        self.assertEqual(preview.iloc[0]["Probability source"], "Stage-transition curve")
+        self.assertEqual(preview.iloc[0]["Stage"], "Phase II")
+        self.assertEqual(preview.iloc[0]["Probability source"], "Stage-transition path")
+        self.assertEqual(preview.iloc[0]["Probability path used"], "Stage-transition path")
         self.assertGreater(preview.iloc[0]["Effective cumulative success probability"], 0.0)
+
+    def test_probability_preview_normalizes_market_alias_to_commercial(self) -> None:
+        product_df = pd.DataFrame(
+            [
+                {
+                    "name": "CommercialAsset",
+                    "stage": "Market",
+                    "success_prob": 1.0,
+                    "include_in_consolidation": True,
+                    "time_to_market": 0,
+                    "patent_years": 10,
+                    "patent_revenue_target": 50_000_000,
+                    "post_patent_revenue_target": 25_000_000,
+                }
+            ]
+        )
+        preview = _build_probability_preview(
+            product_df,
+            ModelConfig(first_year=2024, n_years=10),
+            _default_stage_schedule_mapping(),
+            overwrite_defaults=False,
+            detail_tables={},
+        )
+        self.assertEqual(preview.iloc[0]["Stage"], "Commercial")
+        self.assertEqual(preview.iloc[0]["Probability source"], "Stage-transition path")
 
 
 if __name__ == "__main__":
