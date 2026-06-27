@@ -1,5 +1,6 @@
 import unittest
 from io import BytesIO
+from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -55,6 +56,34 @@ class StreamlitHelperTests(unittest.TestCase):
         self.assertEqual(amounts["Less: debt outstanding"], -40.0)
         self.assertEqual(amounts["Add: cash / (cash deficit)"], 15.0)
         self.assertEqual(amounts["Post-money equity value"], amounts["Pre-money equity value"] + 25.0)
+
+    def test_build_revenue_series_handles_readonly_series_values(self) -> None:
+        model_cfg = ModelConfig(first_year=2024, n_years=6)
+        product_cfg = ProductConfig(
+            name="ReadonlyAsset",
+            stage="Commercial",
+            success_prob=1.0,
+            include_in_consolidation=True,
+            preexisting_market=True,
+            time_to_market=0,
+            patent_years=5,
+            patent_revenue_target=100.0,
+            post_patent_revenue_target=50.0,
+            market_growth_patent=0.0,
+            market_growth_post=0.0,
+        )
+        product = Product(product_cfg, model_cfg)
+
+        def _readonly_values(series: pd.Series):
+            values = series.to_numpy(copy=False)
+            values.setflags(write=False)
+            return values
+
+        with patch.object(pd.Series, "values", new=property(_readonly_values)):
+            revenue = product.build_revenue_series()
+
+        self.assertEqual(len(revenue), model_cfg.n_years)
+        self.assertTrue((revenue >= 0.0).all())
 
     def test_probability_preview_flags_stage_transition_source(self) -> None:
         product_df = pd.DataFrame(

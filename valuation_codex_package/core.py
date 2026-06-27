@@ -596,8 +596,8 @@ class Product:
         target_with_growth = base_target * np.power(1.0 + growth_rate, growth_years)
         years_since_patent_end = years_arr - (patent_end + 1)
         erosion = self._erosion_factors_array(years_since_patent_end, cfg.post_patent_erosion)
-        revenue.values[:] = ramp * target_with_growth * erosion
-        return revenue
+        revenue_data = ramp * target_with_growth * erosion
+        return pd.Series(revenue_data, index=years, name=revenue.name)
 
     def build_cashflow_table(self) -> pd.DataFrame:
         years = self.model_config.years
