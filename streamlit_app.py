@@ -7,6 +7,7 @@ import io
 import importlib
 import os
 import re
+from contextlib import contextmanager
 from io import BytesIO
 from dataclasses import asdict, fields
 from typing import Callable, Dict, List, Optional, Tuple
@@ -477,7 +478,17 @@ def _render_section_warnings(title: str, warnings: List[str]) -> None:
         return
     st.warning(f"{title}: please review the inputs below for scientific, commercial, or financial validity.")
     for warning in warnings:
-        st.write(f"• {warning}")
+        st.write(f"- {warning}")
+
+
+@contextmanager
+def _section_block(title: str, *, heading_level: int = 3, caption: Optional[str] = None):
+    heading_level = min(max(int(heading_level), 1), 6)
+    st.markdown(f"{'#' * heading_level} {title}")
+    if caption:
+        st.caption(caption)
+    with st.container():
+        yield
 
 
 def _template_library() -> Dict[str, pd.DataFrame]:
@@ -2389,8 +2400,13 @@ def _render_schedule_editor(title: str, session_key: str) -> pd.DataFrame:
         schedule_df = schedule_df.iloc[:-1]
         st.session_state[session_key] = schedule_df
 
-    with toolbar_cols[3]:
-        with st.expander("Yearly Increment Helper"):
+    helper_open = toolbar_cols[3].toggle(
+        "Yearly Increment Helper",
+        value=False,
+        key=f"{session_key}_helper_open",
+    )
+    if helper_open:
+        with _section_block("Yearly Increment Helper", heading_level=5):
             def _filter(df: pd.DataFrame, _selected_id: Optional[str], start_year: int) -> pd.Series:
                 return pd.to_numeric(df["Year offset"], errors="coerce").fillna(0).astype(int) >= int(start_year)
 
@@ -6351,7 +6367,11 @@ def main() -> None:
     )
 
     with config_tab:
-        with st.expander("Model assumptions", expanded=True):
+        with _section_block(
+            "Model assumptions",
+            heading_level=2,
+            caption="Configure stage templates, core model settings, financing assumptions, and governance inputs.",
+        ):
 
             with st.expander("Start here: guided setup", expanded=True):
                 st.markdown(
@@ -6389,7 +6409,7 @@ def main() -> None:
                 show_rd = visibility["show_rd"]
                 show_capex = visibility["show_capex"]
 
-            with st.expander("Stage-to-schedule mapping", expanded=False):
+            with _section_block("Stage-to-schedule mapping", heading_level=3):
                 st.caption(
                     "Define default schedule assumptions per stage. These defaults can automatically "
                     "populate product assumptions when the stage changes. Stage durations are used to "
@@ -6722,7 +6742,7 @@ def main() -> None:
                     )
                     vaccine_df = _recompute_vaccine_sales_implied_revenue(vaccine_df)
                     st.session_state["vaccine_sales_table"] = vaccine_df
-                    with st.expander("Yearly Increment Helper", expanded=False):
+                    with _section_block("Yearly Increment Helper", heading_level=4):
                         def _filter(df: pd.DataFrame, selected_id: Optional[str], start_year: int) -> pd.Series:
                             if selected_id is None:
                                 return pd.Series([False] * len(df), index=df.index)
@@ -7230,7 +7250,11 @@ def main() -> None:
                 unwind_working_capital=True,
             )
 
-        with st.expander("Product assumptions", expanded=True):
+        with _section_block(
+            "Product assumptions",
+            heading_level=2,
+            caption="Define development, commercial, cost, R&D, CAPEX, royalty, and market-share inputs by asset.",
+        ):
 
             dev_df = _render_product_assumption_table(
                 session_key="vaccine_development_table",
@@ -7497,7 +7521,7 @@ def main() -> None:
 
             if show_capex:
                 with st.expander("Vaccine CAPEX assumptions", expanded=True):
-                    with st.expander("Shared CAPEX pools", expanded=False):
+                    with _section_block("Shared CAPEX pools", heading_level=4):
                         shared_pools_df = _render_product_assumption_table(
                             session_key="shared_capex_pools_table",
                             default_factory=_default_shared_capex_pools_table,
@@ -7513,7 +7537,7 @@ def main() -> None:
                             },
                         )
                         st.session_state["shared_capex_pools_table"] = shared_pools_df
-                    with st.expander("Shared CAPEX allocation weights", expanded=False):
+                    with _section_block("Shared CAPEX allocation weights", heading_level=4):
                         shared_allocations_df = _render_product_assumption_table(
                             session_key="shared_capex_allocations_table",
                             default_factory=_default_shared_capex_allocations_table,

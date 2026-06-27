@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import load_workbook
+from streamlit.testing.v1 import AppTest
 
 from streamlit_app import (
     _apply_debt_schedule,
@@ -84,6 +85,13 @@ class StreamlitHelperTests(unittest.TestCase):
 
         self.assertEqual(len(revenue), model_cfg.n_years)
         self.assertTrue((revenue >= 0.0).all())
+
+    def test_streamlit_app_smoke_renders_without_exceptions(self) -> None:
+        app = AppTest.from_file("streamlit_app.py")
+
+        app.run(timeout=120)
+
+        self.assertEqual(len(app.exception), 0, app.exception)
 
     def test_probability_preview_flags_stage_transition_source(self) -> None:
         product_df = pd.DataFrame(
