@@ -23,7 +23,12 @@ class ModelConfig:
     discount_rate: float = 0.10
     ev_ebitda_multiple: float = 8.0
     working_capital_pct_sales: float = 0.08
+    opening_nol_balance: float = 0.0
     sales_ramp_factors: List[float] | None = None
+    discount_timing: str = "year_end"
+    terminal_method: str = "exit_multiple"
+    perpetuity_growth_rate: float = 0.02
+    unwind_working_capital: bool = True
 
     def __post_init__(self) -> None:
         if self.sales_ramp_factors is None:
@@ -51,6 +56,12 @@ class ProductConfig:
     post_patent_revenue_target: float = 0.0
     market_growth_patent: float = 0.005
     market_growth_post: float = 0.0
+    patient_population_patent: float = 0.0
+    price_per_patient_patent: float = 0.0
+    penetration_patent: float = 0.0
+    patient_population_post: float = 0.0
+    price_per_patient_post: float = 0.0
+    penetration_post: float = 0.0
 
     cogs_patent: float = 0.30
     cogs_post: float = 0.50
@@ -60,12 +71,17 @@ class ProductConfig:
     sales_marketing_pct: float = 0.15
     gna_pct: float = 0.10
     royalty_pct: float = 0.0
+    commercialization_model: str = "Product Sale"
+    launch_delay_sigma_years: float = 0.0
 
     rd_remaining_pre_launch: float = 0.0
     rd_annual_post_launch: float = 0.0
 
     capex_remaining_pre_launch: float = 0.0
     capex_annual_post_launch: float = 0.0
+    upfront_payment: float = 0.0
+    upfront_year_offset: int = 0
+    upfront_timing: str = "from_start"
 
     rd_capitalization_ratio: float = 0.5
     rd_amort_years: int = 10
@@ -74,6 +90,7 @@ class ProductConfig:
     stage_duration_years: Dict[str, int] = field(default_factory=dict)
     stage_cost_weights: Dict[str, float] = field(default_factory=dict)
     stage_capex_weights: Dict[str, float] = field(default_factory=dict)
+    trial_costs_by_phase: Dict[str, float] = field(default_factory=dict)
     stage_transition_probabilities: Dict[str, float] = field(default_factory=dict)
     stage_transition_curve: Dict[str, List[float]] = field(default_factory=dict)
     post_patent_erosion: List[float] = field(default_factory=lambda: [1.0, 0.85, 0.7, 0.55, 0.4])
@@ -123,6 +140,10 @@ def _scale_product_config(
     cfg_dict["rd_annual_post_launch"] *= cost_multiplier
     cfg_dict["capex_remaining_pre_launch"] *= cost_multiplier
     cfg_dict["capex_annual_post_launch"] *= cost_multiplier
+    cfg_dict["trial_costs_by_phase"] = {
+        stage: float(amount) * cost_multiplier
+        for stage, amount in (config.trial_costs_by_phase or {}).items()
+    }
     cfg_dict["success_prob"] = max(0.0, min(1.0, cfg_dict["success_prob"] * success_prob_multiplier))
     cfg_dict["milestones"] = [
         Milestone(**asdict(milestone)) if isinstance(milestone, Milestone) else Milestone(**milestone)
@@ -182,6 +203,15 @@ class Product:
 
     def _patent_end_year(self) -> int:
         return self._launch_year() + self.config.patent_years - 1
+
+    def probability_source(self) -> str:
+        cfg = self.config
+        if cfg.stage_transition_curve or cfg.stage_transition_probabilities:
+            return "stage_transitions"
+        return "success_prob"
+
+    def effective_success_probability(self) -> float:
+        return self._stage_success_probability()
 
     @staticmethod
     def _ramp_factors_array(years_since_launch: np.ndarray, ramp_factors: Iterable[float]) -> np.ndarray:
@@ -245,6 +275,35 @@ class Product:
         prob = float(np.prod(transitions)) if transitions else 1.0
         return max(0.0, min(1.0, prob))
 
+    def _resolved_revenue_targets(self) -> tuple[float, float]:
+        cfg = self.config
+        patent_target = float(cfg.patent_revenue_target or 0.0)
+        post_target = float(cfg.post_patent_revenue_target or 0.0)
+
+        if (
+            cfg.patient_population_patent > 0
+            and cfg.price_per_patient_patent > 0
+            and cfg.penetration_patent > 0
+        ):
+            patent_target = (
+                float(cfg.patient_population_patent)
+                * float(cfg.price_per_patient_patent)
+                * float(cfg.penetration_patent)
+            )
+
+        if (
+            cfg.patient_population_post > 0
+            and cfg.price_per_patient_post > 0
+            and cfg.penetration_post > 0
+        ):
+            post_target = (
+                float(cfg.patient_population_post)
+                * float(cfg.price_per_patient_post)
+                * float(cfg.penetration_post)
+            )
+
+        return patent_target, post_target
+
     def _success_prob_schedule(self) -> pd.Series:
         years = self.model_config.years
         cfg = self.config
@@ -285,8 +344,10 @@ class Product:
         pre_years = max(1, int(cfg.time_to_market))
         schedule = np.ones(len(years), dtype=float)
         ramp = np.linspace(1.0, cumulative_prob, num=pre_years + 1)
-        schedule[: pre_years + 1] = ramp
-        schedule[pre_years + 1 :] = cumulative_prob
+        end_idx = min(len(schedule), len(ramp))
+        schedule[:end_idx] = ramp[:end_idx]
+        if end_idx < len(schedule):
+            schedule[end_idx:] = cumulative_prob
         return pd.Series(schedule, index=years)
 
     @staticmethod
@@ -364,6 +425,54 @@ class Product:
         values[:pre_years] = -np.array(per_year[:pre_years])
         return pd.Series(values, index=index)
 
+    def _phase_explicit_prelaunch_cashflow(
+        self,
+        phase_amounts: Dict[str, float],
+        index: np.ndarray,
+    ) -> pd.Series:
+        cfg = self.config
+        values = np.zeros(len(index))
+        if not phase_amounts or cfg.preexisting_market or cfg.stage not in STAGE_SEQUENCE:
+            return pd.Series(values, index=index)
+
+        stage_idx = STAGE_SEQUENCE.index(cfg.stage)
+        phases = STAGE_SEQUENCE[stage_idx:-1]
+        offset = 0
+        for phase in phases:
+            duration = max(0, int(cfg.stage_duration_years.get(phase, 0)))
+            if duration <= 0:
+                continue
+            phase_total = max(0.0, float(phase_amounts.get(phase, 0.0)))
+            annual = phase_total / duration if duration else 0.0
+            next_offset = min(offset + duration, len(index))
+            values[offset:next_offset] = -annual
+            offset = next_offset
+            if offset >= len(index):
+                break
+        return pd.Series(values, index=index)
+
+    def _normalized_milestones(self) -> List[Milestone]:
+        normalized: List[Milestone] = []
+        for milestone in self.config.milestones:
+            if isinstance(milestone, Milestone):
+                normalized.append(milestone)
+                continue
+            try:
+                normalized.append(Milestone(**milestone))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if float(self.config.upfront_payment or 0.0) != 0.0:
+            normalized.append(
+                Milestone(
+                    name="Upfront payment",
+                    year_offset=int(self.config.upfront_year_offset),
+                    amount=float(self.config.upfront_payment),
+                    probability=1.0,
+                    timing=self.config.upfront_timing or "from_start",
+                )
+            )
+        return normalized
+
     def build_revenue_series(self) -> pd.Series:
         years = self.model_config.years
         cfg = self.config
@@ -390,9 +499,10 @@ class Product:
         patent_end = self._patent_end_year()
         years_since_launch = years_arr - launch_year
         in_patent = years_arr <= patent_end
+        patent_target, post_target = self._resolved_revenue_targets()
 
         ramp = self._ramp_factors_array(years_since_launch, ramp_factors)
-        base_target = np.where(in_patent, cfg.patent_revenue_target, cfg.post_patent_revenue_target)
+        base_target = np.where(in_patent, patent_target, post_target)
         growth_rate = np.where(in_patent, cfg.market_growth_patent, cfg.market_growth_post)
         growth_years = self._growth_years(
             years_arr,
@@ -431,11 +541,17 @@ class Product:
 
         rd_cash = pd.Series(0.0, index=years)
         if cfg.rd_remaining_pre_launch > 0 and not cfg.preexisting_market:
-            rd_cash += self._stage_costed_prelaunch_cashflow(
-                cfg.rd_remaining_pre_launch,
-                years,
-                cfg.stage_cost_weights,
-            )
+            if cfg.trial_costs_by_phase:
+                rd_cash += self._phase_explicit_prelaunch_cashflow(
+                    cfg.trial_costs_by_phase,
+                    years,
+                )
+            else:
+                rd_cash += self._stage_costed_prelaunch_cashflow(
+                    cfg.rd_remaining_pre_launch,
+                    years,
+                    cfg.stage_cost_weights,
+                )
 
         launch_year = self._launch_year()
         rd_cash.loc[years >= launch_year] -= cfg.rd_annual_post_launch
@@ -474,16 +590,7 @@ class Product:
             + df["rd_expense_pnl"]
         )
         df["milestones"] = 0.0
-        normalized_milestones: List[Milestone] = []
-        for milestone in cfg.milestones:
-            if isinstance(milestone, Milestone):
-                normalized_milestones.append(milestone)
-                continue
-            try:
-                normalized_milestones.append(Milestone(**milestone))
-            except (TypeError, ValueError, KeyError):
-                continue
-        for milestone in normalized_milestones:
+        for milestone in self._normalized_milestones():
             if milestone.timing == "from_launch":
                 milestone_year = self._launch_year() + milestone.year_offset
             elif milestone.timing == "from_start":
@@ -491,7 +598,7 @@ class Product:
             else:
                 milestone_year = self.model_config.first_year + milestone.year_offset
             if milestone_year in df.index:
-                df.loc[milestone_year, "milestones"] += milestone.amount * milestone.probability
+                df.loc[milestone_year, "milestones"] += milestone.amount
         df["ebit"] = df["ebit"] + df["milestones"]
         df["da"] = -(df["rd_amort"] + df["depreciation"])
         df["ebitda"] = df["ebit"] + df["da"]
@@ -502,7 +609,7 @@ class Product:
         df.loc[positive_ebit, "tax"] = -tax_rate * df.loc[positive_ebit, "ebit"]
         df["nopat"] = df["ebit"] + df["tax"]
 
-        df["fcff"] = df["nopat"] + df["da"] + df["capex_cash"] + df["rd_cap_add"] + df["milestones"]
+        df["fcff"] = df["nopat"] + df["da"] + df["capex_cash"] + df["rd_cap_add"]
         return df
 
     def build_probability_weighted_table(self) -> pd.DataFrame:
@@ -519,6 +626,38 @@ class Portfolio:
     def __init__(self, products: List[Product], model_config: ModelConfig):
         self.products = products
         self.model_config = model_config
+
+    def _apply_consolidated_tax(self, cons_df: pd.DataFrame) -> pd.DataFrame:
+        nol_balance = max(0.0, float(self.model_config.opening_nol_balance or 0.0))
+        tax_rate = float(self.model_config.tax_rate)
+        taxes: List[float] = []
+        taxable_after_nol: List[float] = []
+        nol_used: List[float] = []
+        nol_balances: List[float] = []
+
+        for ebit in cons_df["ebit"].tolist():
+            ebit_val = float(ebit)
+            applied_nol = 0.0
+            taxable = max(0.0, ebit_val)
+            if taxable > 0 and nol_balance > 0:
+                applied_nol = min(taxable, nol_balance)
+                taxable -= applied_nol
+                nol_balance -= applied_nol
+            if ebit_val < 0:
+                nol_balance += -ebit_val
+
+            taxes.append(-tax_rate * taxable)
+            taxable_after_nol.append(taxable)
+            nol_used.append(applied_nol)
+            nol_balances.append(nol_balance)
+
+        cons_df["taxable_income_after_nol"] = taxable_after_nol
+        cons_df["nol_utilized"] = nol_used
+        cons_df["nol_balance"] = nol_balances
+        cons_df["tax"] = taxes
+        cons_df["nopat"] = cons_df["ebit"] + cons_df["tax"]
+        cons_df["fcff"] = cons_df["nopat"] + cons_df["da"] + cons_df["capex_cash"] + cons_df["rd_cap_add"]
+        return cons_df
 
     def consolidated_table(self) -> Dict[str, pd.DataFrame | pd.Series]:
         years = self.model_config.years
@@ -561,8 +700,10 @@ class Portfolio:
             cons_df = cons_df.add(wdf[base_cols], fill_value=0.0)
 
         wc = self.model_config.working_capital_pct_sales * cons_df["revenue"]
-        wc_diff = wc.diff().fillna(0.0)
+        wc_diff = wc.diff().fillna(wc)
+        cons_df["working_capital_balance"] = wc
         cons_df["delta_wc"] = -wc_diff
+        cons_df = self._apply_consolidated_tax(cons_df)
         cons_df["fcff_after_wc"] = cons_df["fcff"] + cons_df["delta_wc"]
 
         return {
@@ -586,6 +727,10 @@ class ValuationResult:
     per_product: Dict[str, pd.DataFrame]
     per_product_prob: Dict[str, pd.DataFrame]
 
+    @property
+    def enterprise_value(self) -> float:
+        return self.rnpv
+
 
 class ValuationEngine:
     """Runs DCF valuation (rNPV, terminal value) on a Portfolio."""
@@ -594,9 +739,17 @@ class ValuationEngine:
         self.portfolio = portfolio
         self.model_config = portfolio.model_config
 
+    def _discount_periods(self, n_periods: int) -> np.ndarray:
+        timing = (self.model_config.discount_timing or "year_end").strip().lower()
+        if timing == "year_0":
+            return np.arange(0, n_periods, dtype=float)
+        if timing == "mid_year":
+            return np.arange(0, n_periods, dtype=float) + 0.5
+        return np.arange(1, n_periods + 1, dtype=float)
+
     def _discounted_cash_flows(self, fcff: pd.Series) -> pd.DataFrame:
         years = fcff.index.values
-        t = np.arange(1, len(years) + 1)
+        t = self._discount_periods(len(years))
         df = pd.DataFrame(index=years)
         df["t"] = t
         df["fcff"] = fcff.values
@@ -606,17 +759,37 @@ class ValuationEngine:
 
     def _add_terminal_value(self, dcf_df: pd.DataFrame, cons_df: pd.DataFrame) -> float:
         last_year = cons_df.index[-1]
-        last_ebitda = cons_df.loc[last_year, "ebitda"]
-        multiple = self.model_config.ev_ebitda_multiple
-        terminal_ebitda = max(0.0, float(last_ebitda))
-        terminal_ev = multiple * terminal_ebitda
+        terminal_method = (self.model_config.terminal_method or "exit_multiple").strip().lower()
+        if terminal_method == "perpetuity_growth":
+            growth = float(self.model_config.perpetuity_growth_rate)
+            rate = float(self.model_config.discount_rate)
+            if rate <= growth:
+                raise ValueError("discount_rate must exceed perpetuity_growth_rate for perpetuity terminal value")
+            terminal_base = float(cons_df.loc[last_year, "fcff_after_wc"])
+            terminal_ev = (terminal_base * (1.0 + growth)) / (rate - growth)
+        else:
+            last_ebitda = cons_df.loc[last_year, "ebitda"]
+            multiple = self.model_config.ev_ebitda_multiple
+            terminal_ebitda = max(0.0, float(last_ebitda))
+            terminal_ev = multiple * terminal_ebitda
 
         t_last = dcf_df.loc[last_year, "t"]
         dcf_df.loc[last_year, "terminal_value"] = terminal_ev
         dcf_df.loc[last_year, "discounted_terminal_value"] = terminal_ev / (
             (1 + self.model_config.discount_rate) ** t_last
         )
-        rnpv = dcf_df["discounted_fcff"].sum() + dcf_df["discounted_terminal_value"].sum()
+        wc_recovery = 0.0
+        if self.model_config.unwind_working_capital:
+            wc_recovery = max(0.0, float(cons_df.get("working_capital_balance", pd.Series(0.0, index=cons_df.index)).iloc[-1]))
+        dcf_df.loc[last_year, "working_capital_recovery"] = wc_recovery
+        dcf_df.loc[last_year, "discounted_working_capital_recovery"] = wc_recovery / (
+            (1 + self.model_config.discount_rate) ** t_last
+        )
+        rnpv = (
+            dcf_df["discounted_fcff"].sum()
+            + dcf_df["discounted_terminal_value"].sum()
+            + dcf_df["discounted_working_capital_recovery"].sum()
+        )
         return rnpv
 
     def run(self) -> ValuationResult:
@@ -777,6 +950,7 @@ class MonteCarloEngine:
         cost_min: float = 0.8,
         cost_max: float = 1.2,
         revenue_cost_correlation: float = 0.3,
+        launch_delay_sigma: float = 0.0,
         random_seed: Optional[int] = None,
     ) -> pd.Series:
         rng = np.random.default_rng(random_seed)
@@ -804,10 +978,16 @@ class MonteCarloEngine:
             cogs_scale = _sample_scale(cost_dist, z[1], cost_sigma, cost_min, cost_max)
 
             for prod in self.base_portfolio.products:
+                delay_sigma = max(
+                    float(launch_delay_sigma),
+                    float(getattr(prod.config, "launch_delay_sigma_years", 0.0) or 0.0),
+                )
+                sampled_delay = int(np.rint(rng.normal(0.0, delay_sigma))) if delay_sigma > 0 else 0
                 new_cfg = _scale_product_config(
                     prod.config,
                     revenue_multiplier=rev_scale,
                     cost_multiplier=cogs_scale,
+                    launch_delay_years=sampled_delay,
                 )
                 new_products.append(Product(new_cfg, model_cfg))
 
@@ -1077,11 +1257,26 @@ def validate_product_config(config: ProductConfig) -> List[str]:
         issues.append(f"{config.name}: time_to_market must be >= 0 for non-preexisting products.")
     if config.sales_ramp_shape and config.sales_ramp_shape not in {"Linear", "S-curve", "Step"}:
         issues.append(f"{config.name}: sales_ramp_shape must be Linear, S-curve, or Step.")
+    if config.launch_delay_sigma_years < 0:
+        issues.append(f"{config.name}: launch_delay_sigma_years must be >= 0.")
+    if config.upfront_timing not in {"from_start", "from_launch"}:
+        issues.append(f"{config.name}: upfront_timing must be 'from_start' or 'from_launch'.")
     for label, value in {
         "rd_remaining_pre_launch": config.rd_remaining_pre_launch,
         "rd_annual_post_launch": config.rd_annual_post_launch,
         "capex_remaining_pre_launch": config.capex_remaining_pre_launch,
         "capex_annual_post_launch": config.capex_annual_post_launch,
+        "upfront_payment": config.upfront_payment,
+    }.items():
+        if value < 0:
+            issues.append(f"{config.name}: {label} cannot be negative.")
+    for label, value in {
+        "patient_population_patent": config.patient_population_patent,
+        "price_per_patient_patent": config.price_per_patient_patent,
+        "penetration_patent": config.penetration_patent,
+        "patient_population_post": config.patient_population_post,
+        "price_per_patient_post": config.price_per_patient_post,
+        "penetration_post": config.penetration_post,
     }.items():
         if value < 0:
             issues.append(f"{config.name}: {label} cannot be negative.")
@@ -1097,6 +1292,9 @@ def validate_product_config(config: ProductConfig) -> List[str]:
     for stage, weight in config.stage_capex_weights.items():
         if weight < 0:
             issues.append(f"{config.name}: stage capex weight '{stage}' must be >= 0.")
+    for stage, amount in config.trial_costs_by_phase.items():
+        if amount < 0:
+            issues.append(f"{config.name}: trial cost '{stage}' must be >= 0.")
     for key, curve in config.stage_transition_curve.items():
         for prob in curve:
             if not (0.0 <= prob <= 1.0):

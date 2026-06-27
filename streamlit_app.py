@@ -6,6 +6,7 @@ import json
 import io
 import importlib
 import os
+import re
 from io import BytesIO
 from dataclasses import asdict, fields
 from typing import Callable, Dict, List, Optional, Tuple
@@ -2167,7 +2168,7 @@ def _stage_milestones_from_row(
             name=f"{stage} completion milestone",
             year_offset=cumulative_years,
             amount=float(amount),
-            probability=float(probability),
+            probability=1.0,
             timing="from_start",
         )
         milestones.append(milestone)
@@ -2356,10 +2357,259 @@ def _validate_product_df(df: pd.DataFrame) -> pd.DataFrame:
     return validated
 
 
+def _normalized_label(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _as_probability(value: Any) -> float:
+    if value is None or pd.isna(value):
+        return 0.0
+    prob = float(value)
+    if prob > 1.0:
+        prob = prob / 100.0
+    return max(0.0, min(1.0, prob))
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return float(default)
+    return float(numeric)
+
+
+def _capitalization_ratio_from_label(value: Any) -> float:
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0.5
+    match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+    if match:
+        return max(0.0, min(1.0, float(match.group(1)) / 100.0))
+    if "expense" in text:
+        return 0.0
+    if "capital" in text:
+        return 1.0
+    return 0.5
+
+
+def _find_detail_row(df: Optional[pd.DataFrame], vaccine_name: str) -> Optional[pd.Series]:
+    if df is None or df.empty or "Vaccine name" not in df.columns:
+        return None
+    normalized = _normalized_label(vaccine_name)
+    matches = df[df["Vaccine name"].astype(str).map(_normalized_label) == normalized]
+    if matches.empty:
+        return None
+    return matches.iloc[0]
+
+
+def _detail_tables_from_state() -> Dict[str, pd.DataFrame]:
+    return {
+        "development": st.session_state.get("vaccine_development_table", pd.DataFrame()),
+        "market_size_estimation": st.session_state.get("market_size_estimation", pd.DataFrame()),
+        "revenue": st.session_state.get("vaccine_revenue_table", pd.DataFrame()),
+        "cost": st.session_state.get("vaccine_cost_table", pd.DataFrame()),
+        "rd": st.session_state.get("vaccine_rd_table", pd.DataFrame()),
+        "capex": st.session_state.get("vaccine_capex_table", pd.DataFrame()),
+        "royalty": st.session_state.get("vaccine_royalty_table", pd.DataFrame()),
+        "market_share": st.session_state.get("vaccine_market_share_table", pd.DataFrame()),
+    }
+
+
+def _apply_detail_assumption_overrides(
+    cleaned: Dict[str, Any],
+    detail_tables: Optional[Dict[str, pd.DataFrame]],
+) -> Dict[str, Any]:
+    if not detail_tables:
+        return cleaned
+
+    updated = dict(cleaned)
+    product_name = str(updated.get("name") or "").strip()
+    if not product_name:
+        return updated
+
+    development_row = _find_detail_row(detail_tables.get("development"), product_name)
+    market_size_row = _find_detail_row(detail_tables.get("market_size_estimation"), product_name)
+    revenue_row = _find_detail_row(detail_tables.get("revenue"), product_name)
+    cost_row = _find_detail_row(detail_tables.get("cost"), product_name)
+    rd_row = _find_detail_row(detail_tables.get("rd"), product_name)
+    capex_row = _find_detail_row(detail_tables.get("capex"), product_name)
+    royalty_row = _find_detail_row(detail_tables.get("royalty"), product_name)
+    market_share_row = _find_detail_row(detail_tables.get("market_share"), product_name)
+
+    if development_row is not None:
+        if pd.notna(development_row.get("Stage")):
+            updated["stage"] = str(development_row.get("Stage"))
+        if pd.notna(development_row.get("Success Probability %")):
+            updated["success_prob"] = _as_probability(development_row.get("Success Probability %"))
+        if pd.notna(development_row.get("Consolidation")):
+            updated["include_in_consolidation"] = bool(development_row.get("Consolidation"))
+        if pd.notna(development_row.get("Time to market")):
+            updated["time_to_market"] = max(0, int(_as_float(development_row.get("Time to market"))))
+        if pd.notna(development_row.get("Patent duration years")):
+            updated["patent_years"] = max(1, int(_as_float(development_row.get("Patent duration years"))))
+
+    patient_population_patent = float(updated.get("patient_population_patent") or 0.0)
+    penetration_patent = float(updated.get("penetration_patent") or 0.0)
+
+    if market_size_row is not None:
+        tam_customers = _as_float(market_size_row.get("Market size (# customers)"))
+        sam_pct = _as_probability(market_size_row.get("Serviceable Available Market (% TAM)"))
+        serviceable_customers = tam_customers * sam_pct if tam_customers > 0 and sam_pct > 0 else 0.0
+        if serviceable_customers > 0:
+            patient_population_patent = serviceable_customers
+            updated["patient_population_patent"] = serviceable_customers
+            updated["patient_population_post"] = serviceable_customers
+
+    if revenue_row is not None:
+        patent_customers = _as_float(revenue_row.get("Patent customers per year"))
+        patent_price = _as_float(revenue_row.get("Patent price (USD/customer)"))
+        post_customer_adj = _as_probability(revenue_row.get("Post patent customer adj. %"))
+        post_price_adj = _as_probability(revenue_row.get("Post patent price adj. %"))
+        post_patent_customers = revenue_row.get("Post patent customers per year")
+        if pd.isna(post_patent_customers):
+            post_patent_customers = patent_customers * (post_customer_adj or 1.0)
+        post_patent_price = revenue_row.get("Post patent price (USD/customer)")
+        if pd.isna(post_patent_price):
+            post_patent_price = patent_price * (post_price_adj or 1.0)
+        post_patent_customers = _as_float(post_patent_customers)
+        post_patent_price = _as_float(post_patent_price)
+
+        if patient_population_patent > 0 and patent_customers > 0:
+            penetration_patent = min(1.0, patent_customers / patient_population_patent)
+        else:
+            penetration_patent = 1.0 if patent_customers > 0 and patent_price > 0 else 0.0
+
+        updated["patient_population_patent"] = patient_population_patent or patent_customers
+        updated["price_per_patient_patent"] = patent_price
+        updated["penetration_patent"] = penetration_patent
+        updated["patient_population_post"] = post_patent_customers
+        updated["price_per_patient_post"] = post_patent_price
+        updated["penetration_post"] = 1.0 if post_patent_customers > 0 and post_patent_price > 0 else 0.0
+        updated["patent_revenue_target"] = patent_customers * patent_price
+        updated["post_patent_revenue_target"] = post_patent_customers * post_patent_price
+
+    if market_share_row is not None:
+        market_growth = _as_probability(market_share_row.get("Market growth %"))
+        sales_growth = _as_probability(market_share_row.get("Sales growth %"))
+        if sales_growth > 0:
+            updated["market_growth_patent"] = sales_growth
+        if market_growth > 0 or pd.notna(market_share_row.get("Market growth %")):
+            updated["market_growth_post"] = market_growth
+        if float(updated.get("patent_revenue_target") or 0.0) <= 0.0 and pd.notna(
+            market_share_row.get("Revenue target patent (USD)")
+        ):
+            updated["patent_revenue_target"] = _as_float(market_share_row.get("Revenue target patent (USD)"))
+        if float(updated.get("post_patent_revenue_target") or 0.0) <= 0.0 and pd.notna(
+            market_share_row.get("Revenue target post (USD)")
+        ):
+            updated["post_patent_revenue_target"] = _as_float(market_share_row.get("Revenue target post (USD)"))
+
+    if cost_row is not None:
+        updated["cogs_patent"] = _as_probability(cost_row.get("COGS patent % of sales"))
+        updated["cogs_post"] = _as_probability(cost_row.get("COGS post % of sales"))
+        updated["sales_marketing_pct"] = _as_probability(cost_row.get("Marketing annual % of sales"))
+        updated["royalty_pct"] = _as_probability(cost_row.get("Royalties cost % of sales"))
+        gna_total = _as_float(cost_row.get("G&A total (USD)"))
+        revenue_base = float(updated.get("patent_revenue_target") or 0.0)
+        if gna_total > 0 and revenue_base > 0:
+            updated["gna_pct"] = min(1.0, gna_total / revenue_base)
+
+    if rd_row is not None:
+        updated["rd_remaining_pre_launch"] = float(
+            _as_float(rd_row.get("Pre-GTM remaining (USD)"))
+        )
+        updated["rd_annual_post_launch"] = float(
+            _as_float(rd_row.get("Post-GTM annual cost (USD/year)"))
+        )
+        updated["rd_capitalization_ratio"] = _capitalization_ratio_from_label(
+            rd_row.get("Cost accounting (capitalisation)")
+        )
+
+    if capex_row is not None:
+        updated["capex_remaining_pre_launch"] = float(
+            _as_float(capex_row.get("Total Pre-GTM capex (USD)"))
+        )
+        updated["capex_annual_post_launch"] = float(
+            _as_float(capex_row.get("Total Post-GTM capex (USD/year)"))
+        )
+
+    if royalty_row is not None:
+        monetization_model = str(royalty_row.get("Monetization model") or "Product Sale").strip() or "Product Sale"
+        updated["commercialization_model"] = monetization_model
+        if monetization_model.lower() == "licensing":
+            patent_royalty_income = float(
+                _as_float(royalty_row.get("Royalty income (USD)"))
+            )
+            post_patent_revenue = float(
+                _as_float(royalty_row.get("Post patent revenue (USD)"))
+            )
+            royalty_rate = _as_probability(royalty_row.get("Royalty rate (%)"))
+            if patent_royalty_income > 0:
+                updated["patent_revenue_target"] = patent_royalty_income
+                updated["patient_population_patent"] = 0.0
+                updated["price_per_patient_patent"] = 0.0
+                updated["penetration_patent"] = 0.0
+            if post_patent_revenue > 0 and royalty_rate > 0:
+                updated["post_patent_revenue_target"] = post_patent_revenue * royalty_rate
+                updated["patient_population_post"] = 0.0
+                updated["price_per_patient_post"] = 0.0
+                updated["penetration_post"] = 0.0
+
+    stage_weights = updated.get("stage_cost_weights") or {}
+    rd_remaining = float(updated.get("rd_remaining_pre_launch") or 0.0)
+    if stage_weights and rd_remaining > 0:
+        total_weight = sum(float(weight) for weight in stage_weights.values() if float(weight) > 0)
+        if total_weight > 0:
+            updated["trial_costs_by_phase"] = {
+                stage: rd_remaining * (float(weight) / total_weight)
+                for stage, weight in stage_weights.items()
+                if float(weight) > 0
+            }
+
+    return updated
+
+
+def _build_probability_preview(
+    product_df: pd.DataFrame,
+    model_cfg: ModelConfig,
+    stage_mapping: Optional[pd.DataFrame],
+    *,
+    overwrite_defaults: bool,
+    detail_tables: Optional[Dict[str, pd.DataFrame]],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    preview_records = _sanitize_product_records(
+        product_df,
+        stage_mapping=stage_mapping,
+        overwrite_defaults=overwrite_defaults,
+        detail_tables=detail_tables,
+    )
+    for record in preview_records:
+        try:
+            product = Product(ProductConfig(**record), model_cfg)
+        except Exception:
+            continue
+        rows.append(
+            {
+                "Product": record.get("name"),
+                "Stage": record.get("stage"),
+                "Probability source": (
+                    "Stage-transition curve"
+                    if product.probability_source() == "stage_transitions"
+                    else "Single success probability"
+                ),
+                "Input success probability": float(record.get("success_prob", 0.0) or 0.0),
+                "Effective cumulative success probability": product.effective_success_probability(),
+                "Time to market (years)": int(record.get("time_to_market", 0) or 0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _sanitize_product_records(
     df: pd.DataFrame,
     stage_mapping: Optional[pd.DataFrame] = None,
     overwrite_defaults: bool = False,
+    detail_tables: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> List[Dict]:
     records: List[Dict] = []
     cfg_fields = {f.name for f in fields(ProductConfig)}
@@ -2425,6 +2675,7 @@ def _sanitize_product_records(
             milestones = _stage_milestones_from_row(mapping_row, durations, transitions)
             if milestones:
                 cleaned["milestones"] = [asdict(milestone) for milestone in milestones]
+        cleaned = _apply_detail_assumption_overrides(cleaned, detail_tables)
         records.append(cleaned)
     return records
 
@@ -2434,11 +2685,13 @@ def _build_portfolio(
     model_cfg: ModelConfig,
     stage_mapping: Optional[pd.DataFrame] = None,
     overwrite_defaults: bool = False,
+    detail_tables: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Portfolio | None:
     product_records = _sanitize_product_records(
         product_df,
         stage_mapping=stage_mapping,
         overwrite_defaults=overwrite_defaults,
+        detail_tables=detail_tables,
     )
     if not product_records:
         return None
@@ -3240,6 +3493,8 @@ def _build_snapshot_from_result(
     cashflows = dcf["fcff"].tolist()
     if "terminal_value" in dcf.columns:
         cashflows[-1] += float(dcf["terminal_value"].fillna(0.0).iloc[-1])
+    if "working_capital_recovery" in dcf.columns:
+        cashflows[-1] += float(dcf["working_capital_recovery"].fillna(0.0).iloc[-1])
     irr = _compute_irr(cashflows)
     payback = _compute_payback_years(cons.index.tolist(), cashflows)
     capex_total = -float(cons["capex_cash"].sum()) if "capex_cash" in cons.columns else None
@@ -3256,7 +3511,7 @@ def _build_snapshot_from_result(
     revenue_annual = float(cons["revenue"].mean()) if "revenue" in cons.columns else None
     snapshot = {
         "currency": model_cfg.currency,
-        "npv": valuation_result.rnpv,
+        "npv": valuation_result.enterprise_value,
         "irr": irr,
         "dscr_min": None,
         "payback_years": payback,
@@ -3267,9 +3522,12 @@ def _build_snapshot_from_result(
         "sensitivities": sensitivities or [],
         "assumptions": {
             "discount_rate": model_cfg.discount_rate,
+            "discount_timing": getattr(model_cfg, "discount_timing", "year_end"),
             "tax_rate": model_cfg.tax_rate,
             "working_capital_pct": model_cfg.working_capital_pct_sales,
-            "inflation_rate": getattr(model_cfg, "inflation_rate", None),
+            "terminal_method": getattr(model_cfg, "terminal_method", "exit_multiple"),
+            "perpetuity_growth_rate": getattr(model_cfg, "perpetuity_growth_rate", None),
+            "opening_nol_balance": getattr(model_cfg, "opening_nol_balance", 0.0),
         },
     }
     return snapshot
@@ -4215,8 +4473,10 @@ def _apply_debt_schedule(
         balance = end_balance
 
     updated["Debt drawdowns"] = pd.Series(drawdowns.values, index=updated.index)
+    updated["Debt opening balance"] = pd.Series(begin_balances, index=updated.index)
     updated["Debt repayments"] = pd.Series(principal_repayments, index=updated.index)
     updated["Interest paid"] = pd.Series(interest_charges, index=updated.index)
+    updated["Debt closing balance"] = pd.Series(end_balances, index=updated.index)
 
     updated["Net cash from financing"] = (
         updated.get("Equity issuance", 0.0)
@@ -4234,6 +4494,39 @@ def _apply_debt_schedule(
         updated["Ending cash balance"] = beginning_cash + updated["Net change in cash"].cumsum()
 
     return updated
+
+
+def _build_enterprise_to_equity_bridge(
+    valuation_result: Optional[ValuationResult],
+    cash_flow_df: Optional[pd.DataFrame],
+    planned_new_equity: float,
+) -> pd.DataFrame:
+    if valuation_result is None:
+        return pd.DataFrame()
+
+    enterprise_value = float(valuation_result.enterprise_value)
+    ending_cash = 0.0
+    debt_balance = 0.0
+    if cash_flow_df is not None and not cash_flow_df.empty:
+        if "Ending cash balance" in cash_flow_df.columns:
+            ending_cash = float(pd.to_numeric(cash_flow_df["Ending cash balance"], errors="coerce").fillna(0.0).iloc[-1])
+        if "Debt closing balance" in cash_flow_df.columns:
+            debt_balance = float(pd.to_numeric(cash_flow_df["Debt closing balance"], errors="coerce").fillna(0.0).iloc[-1])
+
+    net_debt = debt_balance - ending_cash
+    pre_money_equity = enterprise_value - net_debt
+    post_money_equity = pre_money_equity + float(planned_new_equity)
+
+    return pd.DataFrame(
+        [
+            {"Component": "Enterprise value (DCF)", "Amount": enterprise_value},
+            {"Component": "Less: debt outstanding", "Amount": -debt_balance},
+            {"Component": "Add: cash / (cash deficit)", "Amount": ending_cash},
+            {"Component": "Pre-money equity value", "Amount": pre_money_equity},
+            {"Component": "Planned new equity", "Amount": float(planned_new_equity)},
+            {"Component": "Post-money equity value", "Amount": post_money_equity},
+        ]
+    )
 
 
 def _build_chart_tables(
@@ -6245,12 +6538,51 @@ def main() -> None:
                 with col_a:
                     discount_rate = st.slider("Discount rate", min_value=0.02, max_value=0.30, value=0.10)
                 with col_b:
-                    ev_multiple = st.slider("Terminal EV/EBITDA multiple", 2.0, 30.0, 8.0)
+                    discount_timing = st.selectbox(
+                        "Discount timing",
+                        options=["year_end", "mid_year", "year_0"],
+                        format_func=lambda option: {
+                            "year_end": "Year-end",
+                            "mid_year": "Mid-year",
+                            "year_0": "Year-0",
+                        }.get(option, option),
+                    )
                 with col_c:
                     risk_buffer = st.number_input(
                         "Additional risk premium", min_value=0.0, max_value=0.20, value=0.0, step=0.01
                     )
-                st.caption("Discount rate + premium governs the rNPV and terminal value." )
+                dcf_cols = st.columns(3)
+                with dcf_cols[0]:
+                    terminal_method = st.selectbox(
+                        "Terminal method",
+                        options=["exit_multiple", "perpetuity_growth"],
+                        format_func=lambda option: {
+                            "exit_multiple": "Exit multiple",
+                            "perpetuity_growth": "Perpetuity growth",
+                        }.get(option, option),
+                    )
+                with dcf_cols[1]:
+                    ev_multiple = st.slider("Terminal EV/EBITDA multiple", 2.0, 30.0, 8.0)
+                with dcf_cols[2]:
+                    perpetuity_growth = st.slider(
+                        "Perpetuity growth rate",
+                        min_value=0.0,
+                        max_value=0.08,
+                        value=0.02,
+                        step=0.005,
+                    )
+                opening_nol_balance = st.number_input(
+                    "Opening NOL balance",
+                    min_value=0.0,
+                    value=float(st.session_state.get("opening_nol_balance", 0.0)),
+                    step=5_000_000.0,
+                    format="%0.0f",
+                    key="opening_nol_balance",
+                )
+                st.caption(
+                    "Discount rate + premium governs enterprise value. Terminal method, discount timing, "
+                    "working capital unwind, and NOL usage are now explicit model mechanics."
+                )
 
             with st.expander("Funding required"):
                 funding_required = st.number_input(
@@ -6299,13 +6631,12 @@ def main() -> None:
                 shareholders_df["Ownership %"] = ownership
                 st.session_state["shareholders_table"] = shareholders_df
                 st.metric("Total ownership (post-money)", f"{shareholders_df['Ownership %'].sum():.0%}")
-                if valuation_result is not None:
-                    shareholders_df["Equity value (rNPV)"] = shareholders_df["Ownership %"] * valuation_result.rnpv
-                    st.dataframe(
-                        shareholders_df.style.format(
-                            {"Ownership %": "{:.1%}", "Investment": "{:,.0f}", "Equity value (rNPV)": "{:,.0f}"}
-                        )
+                st.dataframe(
+                    shareholders_df.style.format(
+                        {"Ownership %": "{:.1%}", "Investment": "{:,.0f}"}
                     )
+                )
+                st.caption("Diluted equity values are shown after the valuation run in the EV-to-equity bridge.")
 
             if show_relevant_market_sizes:
                 with st.expander("Relevant market sizes"):
@@ -6348,7 +6679,12 @@ def main() -> None:
                 tax_rate=float(tax_rate),
                 working_capital_pct_sales=float(wc_pct),
                 ev_ebitda_multiple=float(ev_multiple),
+                opening_nol_balance=float(opening_nol_balance),
                 sales_ramp_factors=ramp,
+                discount_timing=str(discount_timing),
+                terminal_method=str(terminal_method),
+                perpetuity_growth_rate=float(perpetuity_growth),
+                unwind_working_capital=True,
             )
 
         with st.expander("Product assumptions", expanded=True):
@@ -6898,14 +7234,36 @@ def main() -> None:
                     stage_column="stage",
                     overwrite=st.session_state.get("stage_mapping_overwrite", False),
                 )
+            detail_tables = _detail_tables_from_state()
             product_df = _validate_product_df(product_df)
             st.session_state["product_table"] = product_df
+            probability_preview = _build_probability_preview(
+                product_df,
+                model_cfg,
+                stage_mapping,
+                overwrite_defaults=st.session_state.get("stage_mapping_overwrite", False),
+                detail_tables=detail_tables,
+            )
+            if not probability_preview.empty:
+                st.markdown("**Probability basis before valuation**")
+                st.dataframe(
+                    probability_preview.style.format(
+                        {
+                            "Input success probability": "{:.1%}",
+                            "Effective cumulative success probability": "{:.1%}",
+                        }
+                    )
+                )
+                st.caption(
+                    "Stage-transition curves are authoritative when present; the single success probability is a fallback only."
+                )
 
             portfolio = _build_portfolio(
                 product_df,
                 model_cfg,
                 stage_mapping=stage_mapping,
                 overwrite_defaults=st.session_state.get("stage_mapping_overwrite", False),
+                detail_tables=detail_tables,
             )
             if portfolio is None:
                 st.info("Add at least one product with a name to run valuations.")
@@ -6921,8 +7279,44 @@ def main() -> None:
                 st.session_state["portfolio"] = portfolio
                 st.session_state["valuation_result"] = valuation_result
                 st.success(
-                    f"Run complete: portfolio rNPV = {valuation_result.rnpv:,.0f} {model_cfg.currency}."
+                    f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
                 )
+                _, _, bridge_cash_flow = _compute_financial_statements(valuation_result.consolidated, model_cfg)
+                bridge_cash_flow = _apply_debt_schedule(
+                    bridge_cash_flow,
+                    st.session_state.get("debt_schedule_table"),
+                    float(st.session_state.get("debt_interest_rate", 0.0)),
+                )
+                equity_bridge = _build_enterprise_to_equity_bridge(
+                    valuation_result,
+                    bridge_cash_flow,
+                    float(st.session_state.get("planned_new_equity", 0.0)),
+                )
+                st.markdown("**Enterprise-to-equity bridge**")
+                st.dataframe(equity_bridge.style.format({"Amount": "{:,.0f}"}), use_container_width=True)
+                shareholders_df = st.session_state.get("shareholders_table")
+                if isinstance(shareholders_df, pd.DataFrame) and not shareholders_df.empty:
+                    ownership_df = shareholders_df.copy()
+                    post_money_equity_value = float(
+                        equity_bridge.loc[
+                            equity_bridge["Component"] == "Post-money equity value",
+                            "Amount",
+                        ].iloc[0]
+                    )
+                    ownership_df["Diluted equity value"] = (
+                        pd.to_numeric(ownership_df.get("Ownership %", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+                        * post_money_equity_value
+                    )
+                    st.dataframe(
+                        ownership_df.style.format(
+                            {
+                                "Ownership %": "{:.1%}",
+                                "Investment": "{:,.0f}",
+                                "Diluted equity value": "{:,.0f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
 
     with financial_tab:
         st.subheader("Financial statements")
@@ -7515,12 +7909,15 @@ def main() -> None:
                 cost_dist = mc_cols[2].selectbox("Cost distribution", ["Normal", "Lognormal", "Uniform"])
                 seed = mc_cols[3].number_input("Random seed", min_value=0, value=42)
 
-                sigma_cols = st.columns(2)
+                sigma_cols = st.columns(3)
                 rev_sigma = sigma_cols[0].number_input(
                     "Revenue sigma", min_value=0.01, max_value=0.5, value=0.15, step=0.01
                 )
                 cost_sigma = sigma_cols[1].number_input(
                     "Cost sigma", min_value=0.01, max_value=0.5, value=0.1, step=0.01
+                )
+                launch_delay_sigma = sigma_cols[2].number_input(
+                    "Launch delay sigma (years)", min_value=0.0, max_value=5.0, value=0.5, step=0.1
                 )
                 rev_bounds = st.columns(2)
                 rev_min = rev_bounds[0].number_input("Revenue min (uniform)", value=0.8, step=0.05)
@@ -7540,6 +7937,7 @@ def main() -> None:
                         revenue_max=float(rev_max),
                         cost_min=float(cost_min),
                         cost_max=float(cost_max),
+                        launch_delay_sigma=float(launch_delay_sigma),
                         random_seed=int(seed),
                     )
                     st.session_state["mc_results"] = sims
