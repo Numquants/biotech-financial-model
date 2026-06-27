@@ -13,11 +13,20 @@ from streamlit_app import (
     _build_portfolio,
     _build_probability_preview,
     _default_stage_schedule_mapping,
+    _set_dataframe_cell,
 )
 from valuation_codex_package.core import ModelConfig, Product, ProductConfig, Portfolio, ValuationEngine
 
 
 class StreamlitHelperTests(unittest.TestCase):
+    def test_set_dataframe_cell_upcasts_for_incompatible_editor_value(self) -> None:
+        df = pd.DataFrame({"Year": [2025]})
+
+        _set_dataframe_cell(df, 0, "Year", None)
+
+        self.assertIsNone(df.at[0, "Year"])
+        self.assertEqual(str(df["Year"].dtype), "object")
+
     def test_enterprise_to_equity_bridge_applies_cash_debt_and_new_equity(self) -> None:
         model_cfg = ModelConfig(first_year=2024, n_years=1, discount_rate=0.0, tax_rate=0.0, ev_ebitda_multiple=0.0)
         product_cfg = ProductConfig(

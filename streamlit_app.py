@@ -1240,6 +1240,10 @@ def _pending_selection_key(select_key: str) -> str:
     return f"{select_key}_pending"
 
 
+def _panel_state_key(section_key: str, panel_name: str) -> str:
+    return f"{section_key}_{panel_name}_open"
+
+
 def _set_pending_selection(select_key: str, value: Optional[object]) -> None:
     st.session_state[_pending_selection_key(select_key)] = value
 
@@ -1622,7 +1626,7 @@ def _edit_selected_row(
     )
     if edited_values is not None:
         for col, val in edited_values.items():
-            df.at[selected_idx, col] = val
+            _set_dataframe_cell(df, selected_idx, col, val)
         st.session_state[section_key] = df
         st.success("Row updated")
     return st.session_state.get(section_key, df)
@@ -1652,6 +1656,7 @@ def _add_row_via_form(
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         st.session_state[section_key] = df
         _set_pending_selection(select_key, _row_identifier(df, df.index[-1], id_column))
+        st.session_state[_panel_state_key(section_key, "add")] = False
         st.success("Row added")
     return st.session_state.get(section_key, df)
 
@@ -1695,15 +1700,47 @@ def _render_product_assumption_table(
     df = _ensure_table_state(session_key, default_factory).copy()
     select_key = f"{session_key}_row_select"
     selected_idx = _render_row_selector(df, select_key, id_column, name_column)
+    edit_panel_key = _panel_state_key(session_key, "edit")
+    add_panel_key = _panel_state_key(session_key, "add")
+    increment_panel_key = _panel_state_key(session_key, "increment")
 
     action_cols = st.columns(4)
     with action_cols[0]:
-        df = _edit_selected_row(session_key, df, selected_idx)
+        edit_open = st.checkbox(
+            "Edit",
+            value=bool(st.session_state.get(edit_panel_key, False)),
+            key=edit_panel_key,
+            help="Open the focused row editor for the selected row.",
+        )
     with action_cols[1]:
-        df = _add_row_via_form(session_key, df, blank_row_factory, select_key, id_column)
+        add_open = st.checkbox(
+            "Add Row",
+            value=bool(st.session_state.get(add_panel_key, False)),
+            key=add_panel_key,
+            help="Open the add-row form.",
+        )
     with action_cols[2]:
         df = _remove_selected_row(session_key, df, selected_idx, select_key, id_column)
     with action_cols[3]:
+        increment_open = st.checkbox(
+            "Yearly Increment",
+            value=bool(st.session_state.get(increment_panel_key, False)),
+            key=increment_panel_key,
+            help="Open the yearly increment helper for the selected row.",
+        )
+
+    if edit_open:
+        st.caption("Focused row editor: update one selected row at a time.")
+        df = _edit_selected_row(session_key, df, selected_idx)
+    else:
+        st.caption("Tick `Edit` to open the focused row editor for the selected row.")
+
+    if add_open:
+        st.caption("Add a new row with all fields visible before it is inserted into the table.")
+        df = _add_row_via_form(session_key, df, blank_row_factory, select_key, id_column)
+
+    if increment_open:
+        st.caption("Apply a fixed yearly change or compounded growth from the selected row onward.")
         df = _apply_yearly_increment(session_key, df, selected_idx)
 
     df = st.session_state.get(session_key, df)
@@ -2264,6 +2301,20 @@ def _blank_debt_schedule_row(df: pd.DataFrame, first_year: int, n_years: int) ->
 
 def _coerce_numeric(series: pd.Series, default: float = 0.0) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(default)
+
+
+def _set_dataframe_cell(df: pd.DataFrame, row_idx: int, column_name: str, value: object) -> None:
+    dtype = df[column_name].dtype
+    if value is None and not pd.api.types.is_object_dtype(dtype):
+        df[column_name] = df[column_name].astype("object")
+    elif isinstance(value, str) and pd.api.types.is_numeric_dtype(dtype):
+        df[column_name] = df[column_name].astype("object")
+
+    try:
+        df.at[row_idx, column_name] = value
+    except (TypeError, ValueError):
+        df[column_name] = df[column_name].astype("object")
+        df.at[row_idx, column_name] = value
 
 
 def _coerce_frame_column(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
