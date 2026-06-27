@@ -8,6 +8,7 @@ from streamlit.testing.v1 import AppTest
 
 from streamlit_app import (
     _apply_debt_schedule,
+    _build_bankable_snapshot_payload,
     _build_financial_excel,
     _build_enterprise_to_equity_bridge,
     _build_investor_waterfall,
@@ -85,6 +86,51 @@ class StreamlitHelperTests(unittest.TestCase):
 
         self.assertEqual(len(revenue), model_cfg.n_years)
         self.assertTrue((revenue >= 0.0).all())
+
+    def test_bankable_snapshot_payload_ignores_advisory_metric_overrides(self) -> None:
+        model_cfg = ModelConfig(first_year=2024, n_years=5, discount_rate=0.10, tax_rate=0.20)
+        product_cfg = ProductConfig(
+            name="LockedSnapshotAsset",
+            stage="Commercial",
+            success_prob=1.0,
+            include_in_consolidation=True,
+            preexisting_market=True,
+            time_to_market=0,
+            patent_years=5,
+            patent_revenue_target=100.0,
+            post_patent_revenue_target=0.0,
+        )
+        portfolio = Portfolio([Product(product_cfg, model_cfg)], model_cfg)
+        valuation_result = ValuationEngine(portfolio).run()
+        advisory_inputs = {
+            "npv": 999_999_999.0,
+            "irr": 9.99,
+            "dscr_min": 0.1,
+            "scenarios": [{"name": "Manual override", "npv": -123.0, "irr": -0.5}],
+            "notes": "Do not export this.",
+        }
+
+        payload = _build_bankable_snapshot_payload(
+            "BIO-LOCK",
+            model_cfg,
+            valuation_result,
+            portfolio,
+            workbook_hash="hash-123",
+            advisory_inputs=advisory_inputs,
+        )
+
+        self.assertEqual(payload["snapshot_source"], "live_model_only")
+        self.assertEqual(payload["project_id"], "BIO-LOCK")
+        self.assertEqual(payload["workbook_hash"], "hash-123")
+        self.assertEqual(payload["advisory_inputs"]["npv"], advisory_inputs["npv"])
+        self.assertEqual(payload["advisory_inputs"]["notes"], advisory_inputs["notes"])
+        self.assertNotEqual(payload["financial_snapshot"]["npv"], advisory_inputs["npv"])
+        self.assertNotEqual(payload["financial_snapshot"]["irr"], advisory_inputs["irr"])
+        self.assertNotEqual(payload["financial_snapshot"]["dscr_min"], advisory_inputs["dscr_min"])
+        self.assertNotEqual(
+            payload["financial_snapshot"]["scenarios"],
+            advisory_inputs["scenarios"],
+        )
 
     def test_streamlit_app_smoke_renders_without_exceptions(self) -> None:
         app = AppTest.from_file("streamlit_app.py")

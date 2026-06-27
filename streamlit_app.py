@@ -3683,6 +3683,58 @@ def _build_snapshot_from_result(
     return snapshot
 
 
+def _empty_financial_snapshot(currency: str = "USD") -> dict:
+    return {
+        "currency": currency,
+        "npv": None,
+        "irr": None,
+        "dscr_min": None,
+        "payback_years": None,
+        "capex_total": None,
+        "opex_annual": None,
+        "revenue_annual": None,
+        "scenarios": [],
+        "sensitivities": [],
+        "assumptions": {},
+    }
+
+
+def _default_rag_advisory_inputs() -> dict:
+    return {
+        "scenarios": [],
+        "notes": "",
+        "workbook_hash": None,
+    }
+
+
+def _build_bankable_snapshot_payload(
+    project_id: str,
+    model_cfg: Optional[ModelConfig],
+    valuation_result: Optional[ValuationResult],
+    portfolio: Optional[Portfolio],
+    *,
+    workbook_hash: Optional[str] = None,
+    advisory_inputs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    snapshot_source = "live_model_only" if model_cfg is not None and valuation_result is not None else "unavailable"
+    locked_snapshot = _empty_financial_snapshot(
+        currency=getattr(model_cfg, "currency", "USD") if model_cfg is not None else "USD"
+    )
+    if snapshot_source == "live_model_only":
+        locked_snapshot = _build_snapshot_from_result(
+            model_cfg,
+            valuation_result,
+            scenarios=_default_scenario_pack(portfolio),
+        )
+    return {
+        "project_id": project_id,
+        "financial_snapshot": locked_snapshot,
+        "workbook_hash": workbook_hash,
+        "snapshot_source": snapshot_source,
+        "advisory_inputs": dict(advisory_inputs or {}),
+    }
+
+
 def _default_scenario_pack(portfolio: Optional[Portfolio]) -> List[dict]:
     if portfolio is None:
         return []
@@ -6046,130 +6098,53 @@ def _render_rag_assistant_page() -> None:
     portfolio = st.session_state.get("portfolio")
 
     if "rag_snapshot" not in st.session_state:
-        if model_cfg is not None and valuation_result is not None:
-            default_scenarios = _default_scenario_pack(portfolio)
-            st.session_state["rag_snapshot"] = _build_snapshot_from_result(
-                model_cfg,
-                valuation_result,
-                scenarios=default_scenarios,
-            )
-        else:
-            st.session_state["rag_snapshot"] = {
-                "currency": "USD",
-                "npv": None,
-                "irr": None,
-                "dscr_min": None,
-                "payback_years": None,
-                "capex_total": None,
-                "opex_annual": None,
-                "revenue_annual": None,
-                "scenarios": [],
-                "sensitivities": [],
-                "assumptions": {},
-            }
-
-    if st.button("Refresh snapshot from latest model", key=f"{rag_key_prefix}_refresh_snapshot"):
-        if model_cfg is None or valuation_result is None:
-            st.warning("Run the model workspace to generate a snapshot.")
-        else:
-            st.session_state["rag_snapshot"] = _build_snapshot_from_result(
-                model_cfg,
-                valuation_result,
-                scenarios=_default_scenario_pack(portfolio),
-            )
+        st.session_state["rag_snapshot"] = _default_rag_advisory_inputs()
 
     snapshot_state = st.session_state["rag_snapshot"]
-    with st.expander("Snapshot inputs", expanded=False):
-        snap_cols = st.columns(3)
-        snapshot_state["currency"] = snap_cols[0].text_input(
-            "Currency",
-            value=snapshot_state.get("currency") or "USD",
-            key=f"{rag_key_prefix}_currency",
-        )
-        snapshot_state["npv"] = snap_cols[1].number_input(
-            "NPV",
-            value=float(snapshot_state["npv"]) if snapshot_state.get("npv") is not None else 0.0,
-            step=1000000.0,
-            key=f"{rag_key_prefix}_npv",
-        )
-        snapshot_state["irr"] = snap_cols[2].number_input(
-            "IRR",
-            value=float(snapshot_state["irr"]) if snapshot_state.get("irr") is not None else 0.0,
-            step=0.01,
-            format="%.4f",
-            key=f"{rag_key_prefix}_irr",
-        )
+    if model_cfg is not None and valuation_result is not None and not snapshot_state.get("scenarios"):
+        snapshot_state["scenarios"] = _default_scenario_pack(portfolio)
 
-        snap_cols2 = st.columns(3)
-        snapshot_state["dscr_min"] = snap_cols2[0].number_input(
-            "Minimum DSCR",
-            value=float(snapshot_state.get("dscr_min") or 0.0),
-            step=0.1,
-            format="%.2f",
-            key=f"{rag_key_prefix}_dscr_min",
-        )
-        snapshot_state["payback_years"] = snap_cols2[1].number_input(
-            "Payback (years)",
-            value=float(snapshot_state.get("payback_years") or 0.0),
-            step=0.1,
-            format="%.2f",
-            key=f"{rag_key_prefix}_payback_years",
-        )
-        snapshot_state["capex_total"] = snap_cols2[2].number_input(
-            "Total capex",
-            value=float(snapshot_state.get("capex_total") or 0.0),
-            step=1000000.0,
-            key=f"{rag_key_prefix}_capex_total",
-        )
+    if st.button("Refresh advisory scenarios from latest model", key=f"{rag_key_prefix}_refresh_snapshot"):
+        if model_cfg is None or valuation_result is None:
+            st.warning("Run the model workspace to seed advisory scenarios from the model.")
+        else:
+            snapshot_state["scenarios"] = _default_scenario_pack(portfolio)
 
-        snap_cols3 = st.columns(2)
-        snapshot_state["opex_annual"] = snap_cols3[0].number_input(
-            "Annual opex",
-            value=float(snapshot_state.get("opex_annual") or 0.0),
-            step=100000.0,
-            key=f"{rag_key_prefix}_opex_annual",
-        )
-        snapshot_state["revenue_annual"] = snap_cols3[1].number_input(
-            "Annual revenue",
-            value=float(snapshot_state.get("revenue_annual") or 0.0),
-            step=100000.0,
-            key=f"{rag_key_prefix}_revenue_annual",
-        )
+    snapshot_payload = _build_bankable_snapshot_payload(
+        project_id,
+        model_cfg,
+        valuation_result,
+        portfolio,
+        workbook_hash=snapshot_state.get("workbook_hash"),
+        advisory_inputs=snapshot_state,
+    )
+    locked_snapshot = snapshot_payload["financial_snapshot"]
+    has_live_model = snapshot_payload["snapshot_source"] == "live_model_only"
 
-        st.markdown("**Financing assumptions**")
-        finance_cols = st.columns(3)
-        snapshot_state["beginning_cash"] = finance_cols[0].number_input(
-            "Beginning cash balance",
-            value=float(snapshot_state.get("beginning_cash") or 0.0),
-            step=1_000_000.0,
-            key=f"{rag_key_prefix}_beginning_cash",
+    with st.expander("Locked export snapshot", expanded=False):
+        st.caption(
+            "Bankable exports use only these model-derived values. Manual overrides are disabled in the export path."
         )
-        snapshot_state["equity_issuance"] = finance_cols[1].number_input(
-            "Annual equity issuance",
-            value=float(snapshot_state.get("equity_issuance") or 0.0),
-            step=1_000_000.0,
-            key=f"{rag_key_prefix}_equity_issuance",
+        snapshot_rows = pd.DataFrame(
+            [
+                {"Metric": "Currency", "Value": locked_snapshot.get("currency")},
+                {"Metric": "NPV", "Value": locked_snapshot.get("npv")},
+                {"Metric": "IRR", "Value": locked_snapshot.get("irr")},
+                {"Metric": "Minimum DSCR", "Value": locked_snapshot.get("dscr_min")},
+                {"Metric": "Payback (years)", "Value": locked_snapshot.get("payback_years")},
+                {"Metric": "Total capex", "Value": locked_snapshot.get("capex_total")},
+                {"Metric": "Annual opex", "Value": locked_snapshot.get("opex_annual")},
+                {"Metric": "Annual revenue", "Value": locked_snapshot.get("revenue_annual")},
+            ]
         )
-        snapshot_state["debt_draw"] = finance_cols[2].number_input(
-            "Annual debt drawdowns",
-            value=float(snapshot_state.get("debt_draw") or 0.0),
-            step=1_000_000.0,
-            key=f"{rag_key_prefix}_debt_draw",
-        )
-        finance_cols2 = st.columns(2)
-        snapshot_state["debt_repay"] = finance_cols2[0].number_input(
-            "Annual debt repayments",
-            value=float(snapshot_state.get("debt_repay") or 0.0),
-            step=1_000_000.0,
-            key=f"{rag_key_prefix}_debt_repay",
-        )
-        snapshot_state["interest_paid"] = finance_cols2[1].number_input(
-            "Annual interest paid",
-            value=float(snapshot_state.get("interest_paid") or 0.0),
-            step=100_000.0,
-            key=f"{rag_key_prefix}_interest_paid",
-        )
+        st.dataframe(snapshot_rows, hide_index=True, use_container_width=True)
+        if not has_live_model:
+            st.warning("Run the model workspace to generate a locked snapshot for lender/investor exports.")
 
+    with st.expander("Advisory scenario inputs (not exported)", expanded=False):
+        st.caption(
+            "These notes can support AI drafting and internal discussion, but they are excluded from bankable exports."
+        )
         scenarios_df = pd.DataFrame(snapshot_state.get("scenarios") or [])
         scenarios_df = st.data_editor(
             scenarios_df,
@@ -6183,12 +6158,11 @@ def _render_rag_assistant_page() -> None:
             key=f"{rag_key_prefix}_scenarios_editor",
         )
         snapshot_state["scenarios"] = scenarios_df.to_dict(orient="records")
-
-    snapshot_payload = {
-        "project_id": project_id,
-        "financial_snapshot": snapshot_state,
-        "workbook_hash": snapshot_state.get("workbook_hash"),
-    }
+        snapshot_state["notes"] = st.text_area(
+            "Advisory notes",
+            value=str(snapshot_state.get("notes") or ""),
+            key=f"{rag_key_prefix}_advisory_notes",
+        )
 
     has_uploads = bool(uploads)
     has_indexed = bool(st.session_state.get("rag_last_ingest"))
@@ -6263,11 +6237,21 @@ def _render_rag_assistant_page() -> None:
     st.caption(
         "Generate a consolidated business plan bundle that includes the full financial report and snapshot."
     )
-    if st.button("Prepare business plan bundle", key=f"{rag_key_prefix}_bundle"):
+    if st.button(
+        "Prepare business plan bundle",
+        key=f"{rag_key_prefix}_bundle",
+        disabled=not has_live_model,
+    ):
         st.session_state["rag_bundle_ready"] = True
         st.success("Bundle ready. Download below.")
+    if not has_live_model:
+        st.caption("Run the model workspace first. Business plan exports now require locked model outputs.")
 
     if st.session_state.get("rag_bundle_ready"):
+        if not has_live_model:
+            st.warning("Locked export data is unavailable. Re-run the model before preparing a business plan bundle.")
+            st.session_state["rag_bundle_ready"] = False
+            return
         valuation_result = st.session_state.get("valuation_result")
         model_cfg = st.session_state.get("model_config")
         perf_df = None
@@ -6283,7 +6267,6 @@ def _render_rag_assistant_page() -> None:
             st.session_state.get("debt_schedule_table"),
             float(st.session_state.get("debt_interest_rate", 0.0)),
         )
-        cash_flow_df = _apply_cash_flow_assumptions(cash_flow_df, snapshot_state)
         bundle_payload = {
             "snapshot": snapshot_payload,
             "ai_config": st.session_state.get("rag_ai_config", {}),
@@ -6298,20 +6281,7 @@ def _render_rag_assistant_page() -> None:
             st.session_state.get("model_config"),
             st.session_state.get("portfolio"),
         )
-        custom_scenarios = snapshot_state.get("scenarios") or []
-        custom_rows = []
-        for scenario in custom_scenarios:
-            if isinstance(scenario, dict):
-                custom_rows.append(
-                    {
-                        "scenario": scenario.get("name") or scenario.get("scenario") or "Scenario",
-                        "npv": scenario.get("npv"),
-                        "irr": scenario.get("irr"),
-                    }
-                )
-        if custom_rows:
-            chart_tables["scenario_custom"] = pd.DataFrame(custom_rows)
-        monte_carlo_df = _build_monte_carlo_results(snapshot_state)
+        monte_carlo_df = _build_monte_carlo_results(snapshot_payload["financial_snapshot"])
         if not monte_carlo_df.empty:
             chart_tables["monte_carlo_results"] = monte_carlo_df
         export_payload = _build_export_payload(
