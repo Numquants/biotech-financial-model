@@ -333,53 +333,53 @@ def _default_products() -> pd.DataFrame:
     data = [
         {
             "name": "AgSeed-101",
-            "stage": "Phase II",
-            "success_prob": 0.35,
-            "sales_ramp_length": 5,
+            "stage": "Approval",
+            "success_prob": 1.0,
+            "sales_ramp_length": 3,
             "sales_ramp_shape": "Linear",
             "include_in_consolidation": True,
-            "time_to_market": 4,
-            "patent_years": 15,
-            "patent_revenue_target": 120_000_000,
-            "post_patent_revenue_target": 60_000_000,
-            "market_growth_patent": 0.04,
-            "market_growth_post": 0.0,
-            "cogs_patent": 0.32,
-            "cogs_post": 0.5,
-            "labor_pct": 0.14,
-            "overhead_pct": 0.09,
-            "material_pct": 0.11,
-            "sales_marketing_pct": 0.18,
-            "gna_pct": 0.12,
-            "rd_remaining_pre_launch": 180_000_000,
-            "rd_annual_post_launch": 12_000_000,
-            "capex_remaining_pre_launch": 55_000_000,
-            "capex_annual_post_launch": 6_500_000,
+            "time_to_market": 1,
+            "patent_years": 18,
+            "patent_revenue_target": 220_000_000,
+            "post_patent_revenue_target": 180_000_000,
+            "market_growth_patent": 0.03,
+            "market_growth_post": 0.01,
+            "cogs_patent": 0.26,
+            "cogs_post": 0.32,
+            "labor_pct": 0.09,
+            "overhead_pct": 0.06,
+            "material_pct": 0.07,
+            "sales_marketing_pct": 0.12,
+            "gna_pct": 0.08,
+            "rd_remaining_pre_launch": 80_000_000,
+            "rd_annual_post_launch": 6_000_000,
+            "capex_remaining_pre_launch": 25_000_000,
+            "capex_annual_post_launch": 2_500_000,
         },
         {
             "name": "BioYield-Plus",
-            "stage": "Phase III",
-            "success_prob": 0.55,
-            "sales_ramp_length": 5,
-            "sales_ramp_shape": "Linear",
+            "stage": "Commercial",
+            "success_prob": 1.0,
+            "sales_ramp_length": 1,
+            "sales_ramp_shape": "Step",
             "include_in_consolidation": True,
-            "time_to_market": 2,
-            "patent_years": 17,
-            "patent_revenue_target": 200_000_000,
-            "post_patent_revenue_target": 95_000_000,
+            "time_to_market": 0,
+            "patent_years": 20,
+            "patent_revenue_target": 300_000_000,
+            "post_patent_revenue_target": 240_000_000,
             "market_growth_patent": 0.03,
             "market_growth_post": 0.01,
-            "cogs_patent": 0.28,
-            "cogs_post": 0.45,
-            "labor_pct": 0.12,
-            "overhead_pct": 0.08,
-            "material_pct": 0.1,
-            "sales_marketing_pct": 0.16,
-            "gna_pct": 0.1,
-            "rd_remaining_pre_launch": 90_000_000,
-            "rd_annual_post_launch": 8_000_000,
-            "capex_remaining_pre_launch": 35_000_000,
-            "capex_annual_post_launch": 4_500_000,
+            "cogs_patent": 0.24,
+            "cogs_post": 0.30,
+            "labor_pct": 0.08,
+            "overhead_pct": 0.05,
+            "material_pct": 0.06,
+            "sales_marketing_pct": 0.11,
+            "gna_pct": 0.07,
+            "rd_remaining_pre_launch": 0.0,
+            "rd_annual_post_launch": 4_000_000,
+            "capex_remaining_pre_launch": 0.0,
+            "capex_annual_post_launch": 2_000_000,
         },
     ]
     return pd.DataFrame(data)
@@ -607,26 +607,21 @@ def _blank_product_row(name: str = "New vaccine") -> Dict:
 
 def _default_vaccine_sales_table(first_year: int = 2024, horizon_years: int = 5) -> pd.DataFrame:
     years = [first_year + i for i in range(max(horizon_years, 1))]
-    def _extend(values: List[float], target_len: int) -> List[float]:
-        if len(values) >= target_len:
-            return values[:target_len]
-        if not values:
-            return [0.0] * target_len
-        return values + [values[-1]] * (target_len - len(values))
-
-    doses = _extend([5, 7, 10, 12, 12], len(years))
-    prices = _extend([25, 26, 27, 27, 28], len(years))
-    vaccine_rows = _default_vaccine_revenue_table()[["ID_vaccine", "Vaccine name"]]
+    vaccine_rows = _default_vaccine_revenue_table()[
+        ["ID_vaccine", "Vaccine name", "Patent customers per year", "Patent price (USD/customer)"]
+    ]
     rows: List[Dict[str, Any]] = []
     for _, vaccine in vaccine_rows.iterrows():
-        for idx, year in enumerate(years):
+        doses = float(vaccine.get("Patent customers per year", 0.0) or 0.0) / 1e6
+        price = float(vaccine.get("Patent price (USD/customer)", 0.0) or 0.0)
+        for year in years:
             rows.append(
                 {
                     "ID_vaccine": vaccine["ID_vaccine"],
                     "Vaccine name": vaccine["Vaccine name"],
                     "Year": year,
-                    "Doses (M)": doses[idx],
-                    "Price per dose": prices[idx],
+                    "Doses (M)": doses,
+                    "Price per dose": price,
                     "Comments": "",
                 }
             )
@@ -675,14 +670,20 @@ def _default_uses_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Item": "Clinical trials",
-            "Amount": 150_000_000,
+            "Item": "Final approval, launch readiness, and market access",
+            "Amount": 110_000_000,
+        },
+        {
+            "ID_vaccine": "VAC-002",
+            "Vaccine name": "BioYield-Plus",
+            "Item": "Commercial capacity, channels, and support programs",
+            "Amount": 90_000_000,
         },
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Item": "Manufacturing scale-up",
-            "Amount": 90_000_000,
+            "Item": "Working capital buffer and contingency",
+            "Amount": 50_000_000,
         },
     ]
     return pd.DataFrame(data)
@@ -709,8 +710,9 @@ def _blank_use_row(df: pd.DataFrame) -> Dict:
 
 def _default_sources_table() -> pd.DataFrame:
     data = [
-        {"Item": "Existing cash", "Amount": 40_000_000},
-        {"Item": "New equity", "Amount": 200_000_000},
+        {"Item": "Existing cash", "Amount": 35_000_000},
+        {"Item": "Strategic grant", "Amount": 10_000_000},
+        {"Item": "New equity", "Amount": 85_000_000},
     ]
     return pd.DataFrame(data)
 
@@ -726,16 +728,16 @@ def _default_shareholders_table() -> pd.DataFrame:
             "Security": "Common",
             "Seniority": 3,
             "Ownership %": 0.35,
-            "Investment": 25_000_000,
+            "Investment": 30_000_000,
             "Liquidation preference (x)": 0.0,
             "Participating preferred": False,
         },
         {
-            "Shareholder": "Series A fund",
+            "Shareholder": "Growth fund",
             "Security": "Preferred",
             "Seniority": 1,
-            "Ownership %": 0.4,
-            "Investment": 80_000_000,
+            "Ownership %": 0.65,
+            "Investment": 55_000_000,
             "Liquidation preference (x)": 1.0,
             "Participating preferred": False,
         },
@@ -757,8 +759,8 @@ def _blank_shareholder_row(df: pd.DataFrame) -> Dict:
 
 def _default_market_sizes_table() -> pd.DataFrame:
     data = [
-        {"Segment": "Global vaccine market", "Value": 80_000_000_000},
-        {"Segment": "Target indication", "Value": 12_000_000_000},
+        {"Segment": "Crop protection biologics", "Value": 2_750_000_000},
+        {"Segment": "Soil and yield enhancement platforms", "Value": 3_750_000_000},
     ]
     return pd.DataFrame(data)
 
@@ -772,25 +774,25 @@ def _default_vaccine_development_table(first_year: int = 2024) -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Stage": "Phase II",
-            "Success Probability %": 35.0,
+            "Stage": "Approval",
+            "Success Probability %": 100.0,
             "Consolidation": True,
-            "First year forecast": first_year + 2,
-            "Time to market": 4,
-            "Market entry year": first_year + 6,
-            "Patent duration years": 15,
-            "End patent year": first_year + 20,
+            "First year forecast": first_year,
+            "Time to market": 1,
+            "Market entry year": first_year + 1,
+            "Patent duration years": 18,
+            "End patent year": first_year + 18,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Stage": "Phase III",
-            "Success Probability %": 55.0,
+            "Stage": "Commercial",
+            "Success Probability %": 100.0,
             "Consolidation": True,
-            "First year forecast": first_year + 1,
-            "Time to market": 2,
-            "Market entry year": first_year + 3,
-            "Patent duration years": 17,
+            "First year forecast": first_year,
+            "Time to market": 0,
+            "Market entry year": first_year,
+            "Patent duration years": 20,
             "End patent year": first_year + 19,
         },
     ]
@@ -802,20 +804,20 @@ def _default_market_size_estimation_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Market size (# customers)": 5_000_000,
-            "Average spend (USD/customer)": 120,
-            "Serviceable Available Market (% TAM)": 60.0,
-            "Serviceable Available Market (% Market size)": 45.0,
-            "Serviceable Obtainable Market (%)": 25.0,
+            "Market size (# customers)": 7_000_000,
+            "Average spend (USD/customer)": 65,
+            "Serviceable Available Market (% TAM)": 80.0,
+            "Serviceable Available Market (% Market size)": 70.0,
+            "Serviceable Obtainable Market (%)": 55.0,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Market size (# customers)": 8_000_000,
-            "Average spend (USD/customer)": 150,
-            "Serviceable Available Market (% TAM)": 55.0,
-            "Serviceable Available Market (% Market size)": 35.0,
-            "Serviceable Obtainable Market (%)": 18.0,
+            "Market size (# customers)": 6_500_000,
+            "Average spend (USD/customer)": 75,
+            "Serviceable Available Market (% TAM)": 80.0,
+            "Serviceable Available Market (% Market size)": 75.0,
+            "Serviceable Obtainable Market (%)": 70.0,
         },
     ]
     return pd.DataFrame(data)
@@ -826,17 +828,17 @@ def _default_vaccine_revenue_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Patent customers per year": 3_000_000,
-            "Patent price (USD/customer)": 50,
-            "Post patent customer adj. %": 80.0,
-            "Post patent price adj. %": 85.0,
+            "Patent customers per year": 4_000_000,
+            "Patent price (USD/customer)": 55,
+            "Post patent customer adj. %": 90.0,
+            "Post patent price adj. %": 91.0,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Patent customers per year": 4_200_000,
-            "Patent price (USD/customer)": 65,
-            "Post patent customer adj. %": 75.0,
+            "Patent customers per year": 5_000_000,
+            "Patent price (USD/customer)": 60,
+            "Post patent customer adj. %": 100.0,
             "Post patent price adj. %": 80.0,
         },
     ]
@@ -849,13 +851,13 @@ def _default_royalty_table() -> pd.DataFrame:
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
             "Monetization model": "Product Sale",
-            "Royalty rate (%)": 5.0,
+            "Royalty rate (%)": 0.0,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Monetization model": "Licensing",
-            "Royalty rate (%)": 6.5,
+            "Monetization model": "Product Sale",
+            "Royalty rate (%)": 0.0,
         },
     ]
     return pd.DataFrame(data)
@@ -866,26 +868,26 @@ def _default_market_share_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Relevant market type": "Global row crops",
-            "Relevant market size (USD)": 4_500_000_000,
-            "Revenue target - patent %": 12.0,
-            "Revenue target - post %": 8.0,
-            "Market share patent %": 6.0,
-            "Market share post %": 4.0,
-            "Market growth %": 5.0,
-            "Sales growth %": 8.0,
+            "Relevant market type": "Crop protection biologics",
+            "Relevant market size (USD)": 2_750_000_000,
+            "Revenue target - patent %": 8.0,
+            "Revenue target - post %": 6.55,
+            "Market share patent %": 5.5,
+            "Market share post %": 4.5,
+            "Market growth %": 1.5,
+            "Sales growth %": 3.0,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Relevant market type": "Specialty crops",
-            "Relevant market size (USD)": 3_200_000_000,
-            "Revenue target - patent %": 15.0,
-            "Revenue target - post %": 10.0,
-            "Market share patent %": 7.5,
-            "Market share post %": 5.0,
-            "Market growth %": 4.0,
-            "Sales growth %": 6.0,
+            "Relevant market type": "Soil and yield enhancement platforms",
+            "Relevant market size (USD)": 3_750_000_000,
+            "Revenue target - patent %": 8.0,
+            "Revenue target - post %": 6.4,
+            "Market share patent %": 6.0,
+            "Market share post %": 4.8,
+            "Market growth %": 1.5,
+            "Sales growth %": 3.0,
         },
     ]
     return pd.DataFrame(data)
@@ -896,28 +898,28 @@ def _default_vaccine_cost_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "COGS patent % of sales": 32.0,
-            "COGS post % of sales": 48.0,
-            "Marketing annual % of sales": 18.0,
-            "Marketing launch cost (USD)": 25_000_000,
-            "Indirect staff cost (USD)": 8_500_000,
-            "Electricity (USD)": 1_800_000,
-            "Depreciation (USD)": 3_200_000,
+            "COGS patent % of sales": 26.0,
+            "COGS post % of sales": 32.0,
+            "Marketing annual % of sales": 12.0,
+            "Marketing launch cost (USD)": 10_000_000,
+            "Indirect staff cost (USD)": 10_000_000,
+            "Electricity (USD)": 1_600_000,
+            "Depreciation (USD)": 4_000_000,
             "Interest & amortization (USD)": 2_000_000,
-            "Royalties cost % of sales": 4.0,
+            "Royalties cost % of sales": 0.0,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "COGS patent % of sales": 28.0,
-            "COGS post % of sales": 45.0,
-            "Marketing annual % of sales": 16.0,
-            "Marketing launch cost (USD)": 30_000_000,
-            "Indirect staff cost (USD)": 6_750_000,
-            "Electricity (USD)": 1_400_000,
-            "Depreciation (USD)": 2_750_000,
-            "Interest & amortization (USD)": 1_500_000,
-            "Royalties cost % of sales": 3.5,
+            "COGS patent % of sales": 24.0,
+            "COGS post % of sales": 30.0,
+            "Marketing annual % of sales": 11.0,
+            "Marketing launch cost (USD)": 8_000_000,
+            "Indirect staff cost (USD)": 12_000_000,
+            "Electricity (USD)": 1_500_000,
+            "Depreciation (USD)": 4_500_000,
+            "Interest & amortization (USD)": 3_000_000,
+            "Royalties cost % of sales": 0.0,
         },
     ]
     return pd.DataFrame(data)
@@ -928,18 +930,18 @@ def _default_vaccine_rd_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Cost accounting (capitalisation)": "50% capitalised",
-            "Pre-GTM spent to date (USD)": 120_000_000,
-            "Pre-GTM remaining (USD)": 60_000_000,
-            "Post-GTM annual cost (USD/year)": 12_000_000,
+            "Cost accounting (capitalisation)": "55% capitalised",
+            "Pre-GTM spent to date (USD)": 60_000_000,
+            "Pre-GTM remaining (USD)": 80_000_000,
+            "Post-GTM annual cost (USD/year)": 6_000_000,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Cost accounting (capitalisation)": "40% capitalised",
-            "Pre-GTM spent to date (USD)": 80_000_000,
-            "Pre-GTM remaining (USD)": 40_000_000,
-            "Post-GTM annual cost (USD/year)": 9_500_000,
+            "Cost accounting (capitalisation)": "45% capitalised",
+            "Pre-GTM spent to date (USD)": 150_000_000,
+            "Pre-GTM remaining (USD)": 0.0,
+            "Post-GTM annual cost (USD/year)": 4_000_000,
         },
     ]
     return pd.DataFrame(data)
@@ -950,34 +952,34 @@ def _default_vaccine_capex_table() -> pd.DataFrame:
         {
             "ID_vaccine": "VAC-001",
             "Vaccine name": "AgSeed-101",
-            "Manufacturing & Scale-up Assets (Pre-GTM, USD)": 35_000_000,
-            "Manufacturing & Scale-up Assets (Post-GTM, USD/year)": 3_500_000,
-            "Quality & Compliance Infrastructure (Pre-GTM, USD)": 12_000_000,
-            "Quality & Compliance Infrastructure (Post-GTM, USD/year)": 900_000,
-            "Cold-chain / Distribution Assets (Pre-GTM, USD)": 6_000_000,
-            "Cold-chain / Distribution Assets (Post-GTM, USD/year)": 800_000,
-            "IT / Data / Digital Infrastructure (Pre-GTM, USD)": 4_000_000,
-            "IT / Data / Digital Infrastructure (Post-GTM, USD/year)": 500_000,
-            "Facility Build-out / Leasehold Improvements (Pre-GTM, USD)": 15_000_000,
-            "Facility Build-out / Leasehold Improvements (Post-GTM, USD/year)": 1_200_000,
-            "Process Development & Tech-Transfer Assets (Pre-GTM, USD)": 8_000_000,
-            "Process Development & Tech-Transfer Assets (Post-GTM, USD/year)": 700_000,
+            "Manufacturing & Scale-up Assets (Pre-GTM, USD)": 8_000_000,
+            "Manufacturing & Scale-up Assets (Post-GTM, USD/year)": 700_000,
+            "Quality & Compliance Infrastructure (Pre-GTM, USD)": 4_000_000,
+            "Quality & Compliance Infrastructure (Post-GTM, USD/year)": 350_000,
+            "Cold-chain / Distribution Assets (Pre-GTM, USD)": 2_000_000,
+            "Cold-chain / Distribution Assets (Post-GTM, USD/year)": 200_000,
+            "IT / Data / Digital Infrastructure (Pre-GTM, USD)": 1_500_000,
+            "IT / Data / Digital Infrastructure (Post-GTM, USD/year)": 150_000,
+            "Facility Build-out / Leasehold Improvements (Pre-GTM, USD)": 5_500_000,
+            "Facility Build-out / Leasehold Improvements (Post-GTM, USD/year)": 600_000,
+            "Process Development & Tech-Transfer Assets (Pre-GTM, USD)": 4_000_000,
+            "Process Development & Tech-Transfer Assets (Post-GTM, USD/year)": 500_000,
         },
         {
             "ID_vaccine": "VAC-002",
             "Vaccine name": "BioYield-Plus",
-            "Manufacturing & Scale-up Assets (Pre-GTM, USD)": 22_000_000,
-            "Manufacturing & Scale-up Assets (Post-GTM, USD/year)": 2_800_000,
-            "Quality & Compliance Infrastructure (Pre-GTM, USD)": 8_000_000,
-            "Quality & Compliance Infrastructure (Post-GTM, USD/year)": 650_000,
-            "Cold-chain / Distribution Assets (Pre-GTM, USD)": 4_000_000,
-            "Cold-chain / Distribution Assets (Post-GTM, USD/year)": 550_000,
-            "IT / Data / Digital Infrastructure (Pre-GTM, USD)": 3_000_000,
-            "IT / Data / Digital Infrastructure (Post-GTM, USD/year)": 400_000,
-            "Facility Build-out / Leasehold Improvements (Pre-GTM, USD)": 9_000_000,
-            "Facility Build-out / Leasehold Improvements (Post-GTM, USD/year)": 900_000,
-            "Process Development & Tech-Transfer Assets (Pre-GTM, USD)": 5_000_000,
-            "Process Development & Tech-Transfer Assets (Post-GTM, USD/year)": 450_000,
+            "Manufacturing & Scale-up Assets (Pre-GTM, USD)": 0.0,
+            "Manufacturing & Scale-up Assets (Post-GTM, USD/year)": 600_000,
+            "Quality & Compliance Infrastructure (Pre-GTM, USD)": 0.0,
+            "Quality & Compliance Infrastructure (Post-GTM, USD/year)": 250_000,
+            "Cold-chain / Distribution Assets (Pre-GTM, USD)": 0.0,
+            "Cold-chain / Distribution Assets (Post-GTM, USD/year)": 150_000,
+            "IT / Data / Digital Infrastructure (Pre-GTM, USD)": 0.0,
+            "IT / Data / Digital Infrastructure (Post-GTM, USD/year)": 150_000,
+            "Facility Build-out / Leasehold Improvements (Pre-GTM, USD)": 0.0,
+            "Facility Build-out / Leasehold Improvements (Post-GTM, USD/year)": 500_000,
+            "Process Development & Tech-Transfer Assets (Pre-GTM, USD)": 0.0,
+            "Process Development & Tech-Transfer Assets (Post-GTM, USD/year)": 350_000,
         },
     ]
     return pd.DataFrame(data)
@@ -2289,10 +2291,12 @@ def _apply_stage_schedule_defaults(
 
 def _default_debt_schedule(first_year: int, n_years: int) -> pd.DataFrame:
     years = list(range(int(first_year), int(first_year) + int(n_years)))
+    seed_drawdowns = [60_000_000.0, 20_000_000.0, 20_000_000.0, 20_000_000.0]
+    drawdowns = seed_drawdowns[: len(years)] + [0.0] * max(0, len(years) - len(seed_drawdowns))
     return pd.DataFrame(
         {
             "Year": years,
-            "Debt drawdowns": [0.0] * len(years),
+            "Debt drawdowns": drawdowns,
             "Manual debt repayments": [0.0] * len(years),
         }
     )
@@ -2686,12 +2690,21 @@ def _apply_detail_assumption_overrides(
     stage_weights = updated.get("stage_cost_weights") or {}
     rd_remaining = float(updated.get("rd_remaining_pre_launch") or 0.0)
     if stage_weights and rd_remaining > 0:
-        total_weight = sum(float(weight) for weight in stage_weights.values() if float(weight) > 0)
+        current_stage = str(updated.get("stage") or "").strip()
+        if current_stage in STAGE_SEQUENCE:
+            remaining_stages = set(STAGE_SEQUENCE[STAGE_SEQUENCE.index(current_stage) : -1])
+        else:
+            remaining_stages = set(stage_weights.keys())
+        relevant_weights = {
+            stage: float(weight)
+            for stage, weight in stage_weights.items()
+            if stage in remaining_stages and float(weight) > 0
+        }
+        total_weight = sum(relevant_weights.values())
         if total_weight > 0:
             updated["trial_costs_by_phase"] = {
-                stage: rd_remaining * (float(weight) / total_weight)
-                for stage, weight in stage_weights.items()
-                if float(weight) > 0
+                stage: rd_remaining * (weight / total_weight)
+                for stage, weight in relevant_weights.items()
             }
 
     return updated
@@ -6884,9 +6897,14 @@ def main() -> None:
                                     "Amount": planned_new_equity,
                                 }
                                 st.session_state["sources_table"] = sources_df
-                        sources_total = float(sources_df.get("Amount", pd.Series(dtype=float)).sum())
+                        sources_table_total = float(sources_df.get("Amount", pd.Series(dtype=float)).sum())
+                        sources_total = sources_table_total + debt_draw_total
                         st.session_state["sources_total"] = sources_total
                         st.metric("Total sources", f"{sources_total:,.0f}")
+                        if debt_draw_total:
+                            st.caption(
+                                f"Includes scheduled debt drawdowns of {debt_draw_total:,.0f} from the debt schedule."
+                            )
                         sources_warnings = []
                         if (pd.to_numeric(sources_df.get("Amount", pd.Series(dtype=float)), errors="coerce") < 0).any():
                             sources_warnings.append("Sources contain negative amounts; use positive values.")
