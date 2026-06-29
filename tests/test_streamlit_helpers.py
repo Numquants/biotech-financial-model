@@ -1,5 +1,6 @@
 import unittest
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -23,6 +24,9 @@ from streamlit_app import (
     _set_dataframe_cell,
 )
 from valuation_codex_package.core import ModelConfig, Product, ProductConfig, Portfolio, ValuationEngine
+
+
+APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitHelperTests(unittest.TestCase):
@@ -150,7 +154,7 @@ class StreamlitHelperTests(unittest.TestCase):
         )
 
     def test_streamlit_app_smoke_renders_without_exceptions(self) -> None:
-        app = AppTest.from_file("streamlit_app.py")
+        app = AppTest.from_file(str(APP_PATH))
 
         app.run(timeout=120)
 
