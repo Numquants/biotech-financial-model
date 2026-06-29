@@ -9,6 +9,7 @@ from streamlit.testing.v1 import AppTest
 from streamlit_app import (
     _apply_debt_schedule,
     _build_bankable_snapshot_payload,
+    _build_stage_mapping_candidate_row,
     _build_financial_excel,
     _build_enterprise_to_equity_bridge,
     _build_investor_waterfall,
@@ -16,6 +17,7 @@ from streamlit_app import (
     _build_portfolio,
     _build_probability_preview,
     _default_stage_schedule_mapping,
+    _stage_mapping_row_warnings,
     _set_dataframe_cell,
 )
 from valuation_codex_package.core import ModelConfig, Product, ProductConfig, Portfolio, ValuationEngine
@@ -251,6 +253,45 @@ class StreamlitHelperTests(unittest.TestCase):
             valuation_result.consolidated.loc[milestone_year, "milestones"],
             expected_weighted_milestone,
         )
+
+    def test_stage_mapping_candidate_row_derives_time_to_market_from_durations(self) -> None:
+        mapping_df = _default_stage_schedule_mapping().copy()
+        base_row = mapping_df.loc[mapping_df["Stage"] == "Phase II"].iloc[0]
+
+        candidate = _build_stage_mapping_candidate_row(
+            base_row,
+            {
+                "Stage": "Phase II",
+                "Time to market (years)": 99,
+                "Phase II duration (years)": 3,
+                "Phase III duration (years)": 2,
+                "Approval duration (years)": 1,
+            },
+        )
+
+        self.assertEqual(candidate["Time to market (years)"], 6)
+
+    def test_stage_mapping_row_warnings_preview_inconsistent_approval_row(self) -> None:
+        mapping_df = _default_stage_schedule_mapping().copy()
+        row_idx = mapping_df.index[mapping_df["Stage"] == "Approval"][0]
+        base_row = mapping_df.loc[row_idx]
+
+        candidate = _build_stage_mapping_candidate_row(
+            base_row,
+            {
+                "Stage": "Approval",
+                "Discovery duration (years)": 1,
+                "Preclinical duration (years)": 1,
+                "Phase I duration (years)": 1,
+                "Phase II duration (years)": 2,
+                "Phase III duration (years)": 1,
+                "Approval duration (years)": 1,
+            },
+        )
+        warnings = _stage_mapping_row_warnings(mapping_df, int(row_idx), candidate)
+
+        self.assertTrue(any("time-to-market" in warning for warning in warnings))
+        self.assertTrue(any("early-stage durations" in warning for warning in warnings))
 
     def test_debt_schedule_builds_bullet_profile_and_lender_metrics(self) -> None:
         cash_flow_df = pd.DataFrame(
