@@ -186,6 +186,16 @@ def _inject_app_theme() -> None:
             padding: 0.6rem 0.7rem;
             box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05);
         }
+        .stage-mapping-editor-controls + div[data-testid="stHorizontalBlock"] > div:nth-child(2) > div {
+            padding: 0.55rem;
+            border-radius: 18px;
+            border: 1px solid rgba(29, 78, 216, 0.22);
+            background: linear-gradient(135deg, rgba(219, 234, 254, 0.95), rgba(233, 247, 239, 0.98));
+            box-shadow: 0 14px 30px rgba(29, 78, 216, 0.12);
+        }
+        .stage-mapping-editor-controls + div[data-testid="stHorizontalBlock"] > div:nth-child(2) button {
+            width: 100%;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -6472,280 +6482,290 @@ def main() -> None:
                     _default_stage_schedule_mapping,
                 )
                 previous_mapping = mapping_df.copy()
-                st.markdown("**Stage editor**")
-                st.caption(
-                    "Use a structured editor for one stage at a time. "
-                    "Time to market is derived from the stage-duration inputs before save."
-                )
-                editor_stage_key = "stage_mapping_editor_stage"
-                editor_revision_key = "stage_mapping_editor_revision"
-                editor_flash_key = "stage_mapping_editor_flash"
-                flash_message = st.session_state.pop(editor_flash_key, None)
-                if flash_message:
-                    level, message = flash_message
-                    if level == "success":
-                        st.success(message)
-                    elif level == "warning":
-                        st.warning(message)
-                    else:
-                        st.info(message)
-
-                control_cols = st.columns([2.2, 1.0, 1.0, 3.8])
-                selected_stage = control_cols[0].selectbox(
-                    "Select stage",
-                    options=STAGE_OPTIONS,
-                    key="stage_mapping_selected_stage",
-                )
-                active_stage = st.session_state.get(editor_stage_key)
-                if control_cols[1].button("Edit", key="stage_mapping_edit_open"):
-                    st.session_state[editor_stage_key] = selected_stage
-                    st.session_state[editor_revision_key] = int(
-                        st.session_state.get(editor_revision_key, 0)
-                    ) + 1
-                    st.rerun()
-                if control_cols[2].button(
-                    "Close",
-                    key="stage_mapping_edit_close",
-                    disabled=not active_stage,
-                ):
-                    st.session_state.pop(editor_stage_key, None)
-                    st.session_state[editor_revision_key] = int(
-                        st.session_state.get(editor_revision_key, 0)
-                    ) + 1
-                    st.session_state[editor_flash_key] = ("info", "Stage editor closed.")
-                    st.rerun()
-                if active_stage:
-                    control_cols[3].caption(
-                        f"Editing {active_stage}. Save commits the row; discard reverts the staged changes."
+                with st.expander("Edit stage mapping", expanded=True):
+                    st.caption(
+                        "Use a structured editor for one stage at a time. "
+                        "Time to market is derived from the stage-duration inputs before save."
                     )
-                else:
-                    control_cols[3].caption(
-                        "Select a stage and click Edit to open the structured editor."
-                    )
-
-                active_stage = st.session_state.get(editor_stage_key)
-                if active_stage:
-                    row_mask = (
-                        mapping_df["Stage"].astype(str).map(normalize_stage_label)
-                        == normalize_stage_label(active_stage)
-                    )
-                    if not row_mask.any():
-                        st.warning("Selected stage not found in the mapping table.")
-                    else:
-                        row_idx = mapping_df.index[row_mask][0]
-                        base_row = mapping_df.loc[row_idx].copy()
-                        stage_label = str(base_row.get("Stage") or active_stage)
-                        revision = int(st.session_state.get(editor_revision_key, 0))
-                        updates: Dict[str, float | int | str] = {"Stage": stage_label}
-
-                        st.markdown(f"**Editing {stage_label}**")
-                        core_cols = st.columns(3)
-                        with core_cols[0]:
-                            updates["Success Probability %"] = st.number_input(
-                                "Success Probability %",
-                                min_value=0.0,
-                                max_value=100.0,
-                                value=float(base_row.get("Success Probability %", 0.0) or 0.0),
-                                step=1.0,
-                                key=_stage_mapping_input_key(stage_label, revision, "Success Probability %"),
-                            )
-                        with core_cols[1]:
-                            updates["Sales ramp length (years)"] = st.number_input(
-                                "Sales ramp length (years)",
-                                min_value=0,
-                                value=int(base_row.get("Sales ramp length (years)", 0) or 0),
-                                step=1,
-                                key=_stage_mapping_input_key(stage_label, revision, "Sales ramp length (years)"),
-                            )
-                        with core_cols[2]:
-                            current_shape = base_row.get("Ramp shape", RAMP_SHAPE_OPTIONS[0])
-                            if current_shape not in RAMP_SHAPE_OPTIONS:
-                                current_shape = RAMP_SHAPE_OPTIONS[0]
-                            updates["Ramp shape"] = st.selectbox(
-                                "Ramp shape",
-                                options=RAMP_SHAPE_OPTIONS,
-                                index=RAMP_SHAPE_OPTIONS.index(current_shape),
-                                key=_stage_mapping_input_key(stage_label, revision, "Ramp shape"),
-                            )
-
-                        funding_cols = st.columns(2)
-                        with funding_cols[0]:
-                            updates["R&D remaining pre-launch (USD)"] = st.number_input(
-                                "R&D remaining pre-launch (USD)",
-                                min_value=0.0,
-                                value=float(base_row.get("R&D remaining pre-launch (USD)", 0.0) or 0.0),
-                                step=1_000_000.0,
-                                key=_stage_mapping_input_key(
-                                    stage_label,
-                                    revision,
-                                    "R&D remaining pre-launch (USD)",
-                                ),
-                            )
-                        with funding_cols[1]:
-                            updates["R&D annual post-launch (USD/year)"] = st.number_input(
-                                "R&D annual post-launch (USD/year)",
-                                min_value=0.0,
-                                value=float(base_row.get("R&D annual post-launch (USD/year)", 0.0) or 0.0),
-                                step=1_000_000.0,
-                                key=_stage_mapping_input_key(
-                                    stage_label,
-                                    revision,
-                                    "R&D annual post-launch (USD/year)",
-                                ),
-                            )
-
-                        with st.expander("Stage durations", expanded=True):
-                            st.caption(
-                                "These durations drive the derived time to market for the selected stage."
-                            )
-                            duration_cols = st.columns(3)
-                            for idx, col in enumerate(STAGE_DURATION_COLUMNS):
-                                with duration_cols[idx % 3]:
-                                    updates[col] = st.number_input(
-                                        col,
-                                        min_value=0,
-                                        value=int(base_row.get(col, 0) or 0),
-                                        step=1,
-                                        key=_stage_mapping_input_key(stage_label, revision, col),
-                                    )
-
-                        with st.expander("Transition probabilities", expanded=False):
-                            trans_cols = st.columns(3)
-                            for idx, col in enumerate(STAGE_TRANSITION_COLUMNS):
-                                with trans_cols[idx % 3]:
-                                    updates[col] = st.number_input(
-                                        col,
-                                        min_value=0.0,
-                                        max_value=100.0,
-                                        value=float(base_row.get(col, 0.0) or 0.0),
-                                        step=1.0,
-                                        key=_stage_mapping_input_key(stage_label, revision, col),
-                                    )
-                            annual_cols = st.columns(3)
-                            for idx, col in enumerate(STAGE_TRANSITION_ANNUAL_COLUMNS):
-                                with annual_cols[idx % 3]:
-                                    updates[col] = st.number_input(
-                                        col,
-                                        min_value=0.0,
-                                        max_value=100.0,
-                                        value=float(base_row.get(col, 0.0) or 0.0),
-                                        step=1.0,
-                                        key=_stage_mapping_input_key(stage_label, revision, col),
-                                    )
-
-                        with st.expander("R&D and CAPEX allocation", expanded=False):
-                            rd_cols = st.columns(3)
-                            for idx, col in enumerate(STAGE_COST_WEIGHT_COLUMNS):
-                                with rd_cols[idx % 3]:
-                                    updates[col] = st.number_input(
-                                        col,
-                                        min_value=0.0,
-                                        max_value=100.0,
-                                        value=float(base_row.get(col, 0.0) or 0.0),
-                                        step=1.0,
-                                        key=_stage_mapping_input_key(stage_label, revision, col),
-                                    )
-                            capex_cols = st.columns(3)
-                            for idx, col in enumerate(STAGE_CAPEX_WEIGHT_COLUMNS):
-                                with capex_cols[idx % 3]:
-                                    updates[col] = st.number_input(
-                                        col,
-                                        min_value=0.0,
-                                        max_value=100.0,
-                                        value=float(base_row.get(col, 0.0) or 0.0),
-                                        step=1.0,
-                                        key=_stage_mapping_input_key(stage_label, revision, col),
-                                    )
-
-                        with st.expander("Milestones", expanded=False):
-                            milestone_cols = st.columns(2)
-                            for idx, col in enumerate(STAGE_MILESTONE_COLUMNS):
-                                with milestone_cols[idx % 2]:
-                                    updates[col] = st.number_input(
-                                        col,
-                                        min_value=0.0,
-                                        value=float(base_row.get(col, 0.0) or 0.0),
-                                        step=1_000_000.0,
-                                        key=_stage_mapping_input_key(stage_label, revision, col),
-                                    )
-
-                        candidate_row = _build_stage_mapping_candidate_row(base_row, updates)
-                        row_warnings = _stage_mapping_row_warnings(mapping_df, row_idx, candidate_row)
-
-                        derived_cols = st.columns([1.2, 1.2, 3.6])
-                        derived_cols[0].metric(
-                            "Derived time to market (years)",
-                            int(candidate_row.get("Time to market (years)", 0) or 0),
-                        )
-                        derived_cols[1].metric(
-                            "Saved value",
-                            int(base_row.get("Time to market (years)", 0) or 0),
-                        )
-                        derived_cols[2].caption(
-                            "The saved time-to-market value is computed from the stage-duration inputs above."
-                        )
-
-                        if row_warnings:
-                            st.warning(
-                                "Scientific/commercial check for this stage: review the items below before saving."
-                            )
-                            for warning in row_warnings:
-                                st.write(f"- {warning}")
+                    editor_stage_key = "stage_mapping_editor_stage"
+                    editor_revision_key = "stage_mapping_editor_revision"
+                    editor_flash_key = "stage_mapping_editor_flash"
+                    flash_message = st.session_state.pop(editor_flash_key, None)
+                    if flash_message:
+                        level, message = flash_message
+                        if level == "success":
+                            st.success(message)
+                        elif level == "warning":
+                            st.warning(message)
                         else:
-                            st.success("No row-level scientific/commercial warnings for this stage.")
+                            st.info(message)
 
-                        preview_cols = [
-                            "Stage",
-                            "Success Probability %",
-                            "Time to market (years)",
-                            "Sales ramp length (years)",
-                            "Ramp shape",
-                            "R&D remaining pre-launch (USD)",
-                            "R&D annual post-launch (USD/year)",
-                        ]
-                        st.markdown("**Save preview**")
-                        st.dataframe(
-                            pd.DataFrame([candidate_row.reindex(preview_cols)]),
-                            hide_index=True,
+                    st.markdown('<div class="stage-mapping-editor-controls"></div>', unsafe_allow_html=True)
+                    control_cols = st.columns([2.2, 1.15, 1.0, 3.65])
+                    selected_stage = control_cols[0].selectbox(
+                        "Select stage",
+                        options=STAGE_OPTIONS,
+                        key="stage_mapping_selected_stage",
+                    )
+                    with control_cols[1]:
+                        st.caption("Open structured editor")
+                        edit_clicked = st.button(
+                            "Edit",
+                            key="stage_mapping_edit_open",
+                            type="primary",
                             use_container_width=True,
                         )
+                    active_stage = st.session_state.get(editor_stage_key)
+                    if edit_clicked:
+                        st.session_state[editor_stage_key] = selected_stage
+                        st.session_state[editor_revision_key] = int(
+                            st.session_state.get(editor_revision_key, 0)
+                        ) + 1
+                        st.rerun()
+                    if control_cols[2].button(
+                        "Close",
+                        key="stage_mapping_edit_close",
+                        disabled=not active_stage,
+                    ):
+                        st.session_state.pop(editor_stage_key, None)
+                        st.session_state[editor_revision_key] = int(
+                            st.session_state.get(editor_revision_key, 0)
+                        ) + 1
+                        st.session_state[editor_flash_key] = ("info", "Edit stage mapping closed.")
+                        st.rerun()
+                    if active_stage:
+                        control_cols[3].caption(
+                            f"Editing {active_stage}. Save commits the row; discard reverts the staged changes."
+                        )
+                    else:
+                        control_cols[3].caption(
+                            "Select a stage and click Edit to open the structured editor."
+                        )
 
-                        action_cols = st.columns([1.2, 1.2, 4.6])
-                        if action_cols[0].button("Save stage", key="stage_mapping_edit_save"):
-                            updated_mapping = mapping_df.copy()
-                            for col in updated_mapping.columns:
-                                updated_mapping.at[row_idx, col] = candidate_row.get(
-                                    col,
-                                    updated_mapping.at[row_idx, col],
-                                )
-                            mapping_df = updated_mapping
-                            st.session_state["stage_schedule_mapping"] = mapping_df
-                            if not mapping_df.equals(previous_mapping):
-                                st.session_state["stage_mapping_audit_log"].append(
-                                    {
-                                        "timestamp": pd.Timestamp.utcnow().isoformat(),
-                                        "updated_by": audit_owner,
-                                        "note": f"Stage mapping updated: {stage_label}",
-                                    }
-                                )
-                            st.session_state.pop(editor_stage_key, None)
-                            st.session_state[editor_revision_key] = revision + 1
-                            st.session_state[editor_flash_key] = (
-                                "success",
-                                f"Saved {stage_label} stage assumptions.",
-                            )
-                            st.rerun()
-                        if action_cols[1].button("Discard edits", key="stage_mapping_edit_discard"):
-                            st.session_state.pop(editor_stage_key, None)
-                            st.session_state[editor_revision_key] = revision + 1
-                            st.session_state[editor_flash_key] = (
-                                "info",
-                                f"Discarded edits for {stage_label}.",
-                            )
-                            st.rerun()
+                    active_stage = st.session_state.get(editor_stage_key)
+                    if active_stage:
+                        row_mask = (
+                            mapping_df["Stage"].astype(str).map(normalize_stage_label)
+                            == normalize_stage_label(active_stage)
+                        )
+                        if not row_mask.any():
+                            st.warning("Selected stage not found in the mapping table.")
+                        else:
+                            row_idx = mapping_df.index[row_mask][0]
+                            base_row = mapping_df.loc[row_idx].copy()
+                            stage_label = str(base_row.get("Stage") or active_stage)
+                            revision = int(st.session_state.get(editor_revision_key, 0))
+                            updates: Dict[str, float | int | str] = {"Stage": stage_label}
 
+                            st.markdown(f"**Editing {stage_label}**")
+                            core_cols = st.columns(3)
+                            with core_cols[0]:
+                                updates["Success Probability %"] = st.number_input(
+                                    "Success Probability %",
+                                    min_value=0.0,
+                                    max_value=100.0,
+                                    value=float(base_row.get("Success Probability %", 0.0) or 0.0),
+                                    step=1.0,
+                                    key=_stage_mapping_input_key(stage_label, revision, "Success Probability %"),
+                                )
+                            with core_cols[1]:
+                                updates["Sales ramp length (years)"] = st.number_input(
+                                    "Sales ramp length (years)",
+                                    min_value=0,
+                                    value=int(base_row.get("Sales ramp length (years)", 0) or 0),
+                                    step=1,
+                                    key=_stage_mapping_input_key(stage_label, revision, "Sales ramp length (years)"),
+                                )
+                            with core_cols[2]:
+                                current_shape = base_row.get("Ramp shape", RAMP_SHAPE_OPTIONS[0])
+                                if current_shape not in RAMP_SHAPE_OPTIONS:
+                                    current_shape = RAMP_SHAPE_OPTIONS[0]
+                                updates["Ramp shape"] = st.selectbox(
+                                    "Ramp shape",
+                                    options=RAMP_SHAPE_OPTIONS,
+                                    index=RAMP_SHAPE_OPTIONS.index(current_shape),
+                                    key=_stage_mapping_input_key(stage_label, revision, "Ramp shape"),
+                                )
+
+                            funding_cols = st.columns(2)
+                            with funding_cols[0]:
+                                updates["R&D remaining pre-launch (USD)"] = st.number_input(
+                                    "R&D remaining pre-launch (USD)",
+                                    min_value=0.0,
+                                    value=float(base_row.get("R&D remaining pre-launch (USD)", 0.0) or 0.0),
+                                    step=1_000_000.0,
+                                    key=_stage_mapping_input_key(
+                                        stage_label,
+                                        revision,
+                                        "R&D remaining pre-launch (USD)",
+                                    ),
+                                )
+                            with funding_cols[1]:
+                                updates["R&D annual post-launch (USD/year)"] = st.number_input(
+                                    "R&D annual post-launch (USD/year)",
+                                    min_value=0.0,
+                                    value=float(base_row.get("R&D annual post-launch (USD/year)", 0.0) or 0.0),
+                                    step=1_000_000.0,
+                                    key=_stage_mapping_input_key(
+                                        stage_label,
+                                        revision,
+                                        "R&D annual post-launch (USD/year)",
+                                    ),
+                                )
+
+                            with st.expander("Stage durations", expanded=True):
+                                st.caption(
+                                    "These durations drive the derived time to market for the selected stage."
+                                )
+                                duration_cols = st.columns(3)
+                                for idx, col in enumerate(STAGE_DURATION_COLUMNS):
+                                    with duration_cols[idx % 3]:
+                                        updates[col] = st.number_input(
+                                            col,
+                                            min_value=0,
+                                            value=int(base_row.get(col, 0) or 0),
+                                            step=1,
+                                            key=_stage_mapping_input_key(stage_label, revision, col),
+                                        )
+
+                            with st.expander("Transition probabilities", expanded=False):
+                                trans_cols = st.columns(3)
+                                for idx, col in enumerate(STAGE_TRANSITION_COLUMNS):
+                                    with trans_cols[idx % 3]:
+                                        updates[col] = st.number_input(
+                                            col,
+                                            min_value=0.0,
+                                            max_value=100.0,
+                                            value=float(base_row.get(col, 0.0) or 0.0),
+                                            step=1.0,
+                                            key=_stage_mapping_input_key(stage_label, revision, col),
+                                        )
+                                annual_cols = st.columns(3)
+                                for idx, col in enumerate(STAGE_TRANSITION_ANNUAL_COLUMNS):
+                                    with annual_cols[idx % 3]:
+                                        updates[col] = st.number_input(
+                                            col,
+                                            min_value=0.0,
+                                            max_value=100.0,
+                                            value=float(base_row.get(col, 0.0) or 0.0),
+                                            step=1.0,
+                                            key=_stage_mapping_input_key(stage_label, revision, col),
+                                        )
+
+                            with st.expander("R&D and CAPEX allocation", expanded=False):
+                                rd_cols = st.columns(3)
+                                for idx, col in enumerate(STAGE_COST_WEIGHT_COLUMNS):
+                                    with rd_cols[idx % 3]:
+                                        updates[col] = st.number_input(
+                                            col,
+                                            min_value=0.0,
+                                            max_value=100.0,
+                                            value=float(base_row.get(col, 0.0) or 0.0),
+                                            step=1.0,
+                                            key=_stage_mapping_input_key(stage_label, revision, col),
+                                        )
+                                capex_cols = st.columns(3)
+                                for idx, col in enumerate(STAGE_CAPEX_WEIGHT_COLUMNS):
+                                    with capex_cols[idx % 3]:
+                                        updates[col] = st.number_input(
+                                            col,
+                                            min_value=0.0,
+                                            max_value=100.0,
+                                            value=float(base_row.get(col, 0.0) or 0.0),
+                                            step=1.0,
+                                            key=_stage_mapping_input_key(stage_label, revision, col),
+                                        )
+
+                            with st.expander("Milestones", expanded=False):
+                                milestone_cols = st.columns(2)
+                                for idx, col in enumerate(STAGE_MILESTONE_COLUMNS):
+                                    with milestone_cols[idx % 2]:
+                                        updates[col] = st.number_input(
+                                            col,
+                                            min_value=0.0,
+                                            value=float(base_row.get(col, 0.0) or 0.0),
+                                            step=1_000_000.0,
+                                            key=_stage_mapping_input_key(stage_label, revision, col),
+                                        )
+
+                            candidate_row = _build_stage_mapping_candidate_row(base_row, updates)
+                            row_warnings = _stage_mapping_row_warnings(mapping_df, row_idx, candidate_row)
+
+                            derived_cols = st.columns([1.2, 1.2, 3.6])
+                            derived_cols[0].metric(
+                                "Derived time to market (years)",
+                                int(candidate_row.get("Time to market (years)", 0) or 0),
+                            )
+                            derived_cols[1].metric(
+                                "Saved value",
+                                int(base_row.get("Time to market (years)", 0) or 0),
+                            )
+                            derived_cols[2].caption(
+                                "The saved time-to-market value is computed from the stage-duration inputs above."
+                            )
+
+                            if row_warnings:
+                                st.warning(
+                                    "Scientific/commercial check for this stage: review the items below before saving."
+                                )
+                                for warning in row_warnings:
+                                    st.write(f"- {warning}")
+                            else:
+                                st.success("No row-level scientific/commercial warnings for this stage.")
+
+                            preview_cols = [
+                                "Stage",
+                                "Success Probability %",
+                                "Time to market (years)",
+                                "Sales ramp length (years)",
+                                "Ramp shape",
+                                "R&D remaining pre-launch (USD)",
+                                "R&D annual post-launch (USD/year)",
+                            ]
+                            st.markdown("**Save preview**")
+                            st.dataframe(
+                                pd.DataFrame([candidate_row.reindex(preview_cols)]),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                            action_cols = st.columns([1.2, 1.2, 4.6])
+                            if action_cols[0].button("Save stage", key="stage_mapping_edit_save"):
+                                updated_mapping = mapping_df.copy()
+                                for col in updated_mapping.columns:
+                                    updated_mapping.at[row_idx, col] = candidate_row.get(
+                                        col,
+                                        updated_mapping.at[row_idx, col],
+                                    )
+                                mapping_df = updated_mapping
+                                st.session_state["stage_schedule_mapping"] = mapping_df
+                                if not mapping_df.equals(previous_mapping):
+                                    st.session_state["stage_mapping_audit_log"].append(
+                                        {
+                                            "timestamp": pd.Timestamp.utcnow().isoformat(),
+                                            "updated_by": audit_owner,
+                                            "note": f"Stage mapping updated: {stage_label}",
+                                        }
+                                    )
+                                st.session_state.pop(editor_stage_key, None)
+                                st.session_state[editor_revision_key] = revision + 1
+                                st.session_state[editor_flash_key] = (
+                                    "success",
+                                    f"Saved {stage_label} stage assumptions.",
+                                )
+                                st.rerun()
+                            if action_cols[1].button("Discard edits", key="stage_mapping_edit_discard"):
+                                st.session_state.pop(editor_stage_key, None)
+                                st.session_state[editor_revision_key] = revision + 1
+                                st.session_state[editor_flash_key] = (
+                                    "info",
+                                    f"Discarded edits for {stage_label}.",
+                                )
+                                st.rerun()
+
+                st.info("Editing happens above. Use Edit stage mapping to make changes before reviewing the summary.")
                 with st.expander("Full mapping table (summary)", expanded=False):
-                    st.caption("Read-only summary. Use the stage editor above to make changes.")
+                    st.caption("Read-only summary. Use Edit stage mapping above to make changes.")
                     st.dataframe(
                         mapping_df,
                         hide_index=True,
