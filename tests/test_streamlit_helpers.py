@@ -17,6 +17,8 @@ from streamlit_app import (
     _build_portfolio,
     _build_probability_preview,
     _default_stage_schedule_mapping,
+    _consume_pending_panel_state,
+    _pending_panel_state_key,
     _stage_mapping_row_warnings,
     _set_dataframe_cell,
 )
@@ -24,6 +26,19 @@ from valuation_codex_package.core import ModelConfig, Product, ProductConfig, Po
 
 
 class StreamlitHelperTests(unittest.TestCase):
+    def test_consume_pending_panel_state_applies_deferred_checkbox_value(self) -> None:
+        session_state = {
+            "uses_table_add_open": True,
+            _pending_panel_state_key("uses_table_add_open"): False,
+        }
+
+        with patch("streamlit_app.st.session_state", session_state):
+            pending = _consume_pending_panel_state("uses_table_add_open")
+
+        self.assertFalse(pending)
+        self.assertFalse(session_state["uses_table_add_open"])
+        self.assertNotIn(_pending_panel_state_key("uses_table_add_open"), session_state)
+
     def test_set_dataframe_cell_upcasts_for_incompatible_editor_value(self) -> None:
         df = pd.DataFrame({"Year": [2025]})
 

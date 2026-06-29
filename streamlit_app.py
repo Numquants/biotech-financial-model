@@ -1267,6 +1267,10 @@ def _panel_state_key(section_key: str, panel_name: str) -> str:
     return f"{section_key}_{panel_name}_open"
 
 
+def _pending_panel_state_key(panel_key: str) -> str:
+    return f"{panel_key}_pending"
+
+
 def _set_pending_selection(select_key: str, value: Optional[object]) -> None:
     st.session_state[_pending_selection_key(select_key)] = value
 
@@ -1276,6 +1280,19 @@ def _consume_pending_selection(select_key: str) -> Optional[object]:
     if pending_key in st.session_state:
         value = st.session_state.pop(pending_key)
         st.session_state[select_key] = value
+        return value
+    return None
+
+
+def _set_pending_panel_state(panel_key: str, value: bool) -> None:
+    st.session_state[_pending_panel_state_key(panel_key)] = value
+
+
+def _consume_pending_panel_state(panel_key: str) -> Optional[bool]:
+    pending_key = _pending_panel_state_key(panel_key)
+    if pending_key in st.session_state:
+        value = bool(st.session_state.pop(pending_key))
+        st.session_state[panel_key] = value
         return value
     return None
 
@@ -1679,7 +1696,7 @@ def _add_row_via_form(
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         st.session_state[section_key] = df
         _set_pending_selection(select_key, _row_identifier(df, df.index[-1], id_column))
-        st.session_state[_panel_state_key(section_key, "add")] = False
+        _set_pending_panel_state(_panel_state_key(section_key, "add"), False)
         st.success("Row added")
     return st.session_state.get(section_key, df)
 
@@ -1726,6 +1743,9 @@ def _render_product_assumption_table(
     edit_panel_key = _panel_state_key(session_key, "edit")
     add_panel_key = _panel_state_key(session_key, "add")
     increment_panel_key = _panel_state_key(session_key, "increment")
+    _consume_pending_panel_state(edit_panel_key)
+    _consume_pending_panel_state(add_panel_key)
+    _consume_pending_panel_state(increment_panel_key)
 
     action_cols = st.columns(4)
     with action_cols[0]:
