@@ -6364,6 +6364,35 @@ def _render_rag_assistant_page() -> None:
             rag_key_prefix=rag_key_prefix,
         )
 
+
+def _resolve_valuation_context(
+    candidate_model_cfg: ModelConfig,
+    candidate_portfolio: Portfolio | None,
+) -> tuple[ModelConfig | None, Portfolio | None, object | None, list[str], bool]:
+    saved_model_cfg = st.session_state.get("model_config")
+    saved_portfolio = st.session_state.get("portfolio")
+    saved_valuation_result = st.session_state.get("valuation_result")
+    used_saved_outputs = saved_valuation_result is not None
+
+    if candidate_portfolio is None:
+        return saved_model_cfg, saved_portfolio, saved_valuation_result, [], used_saved_outputs
+
+    validation_issues = validate_portfolio(candidate_portfolio)
+    if validation_issues:
+        return (
+            saved_model_cfg,
+            saved_portfolio,
+            saved_valuation_result,
+            validation_issues,
+            used_saved_outputs,
+        )
+
+    valuation_result = ValuationEngine(candidate_portfolio).run()
+    st.session_state["model_config"] = candidate_model_cfg
+    st.session_state["portfolio"] = candidate_portfolio
+    st.session_state["valuation_result"] = valuation_result
+    return candidate_model_cfg, candidate_portfolio, valuation_result, [], False
+
 def main() -> None:
     st.set_page_config(
         page_title="Biotech Financial Model",
@@ -6373,9 +6402,9 @@ def main() -> None:
     _inject_app_theme()
     _render_model_hero()
 
-    model_cfg: ModelConfig | None = None
-    portfolio: Portfolio | None = None
-    valuation_result = None
+    model_cfg: ModelConfig | None = st.session_state.get("model_config")
+    portfolio: Portfolio | None = st.session_state.get("portfolio")
+    valuation_result = st.session_state.get("valuation_result")
 
     (
         config_tab,
@@ -7916,31 +7945,40 @@ def main() -> None:
                     "Stage-transition curves are authoritative when present; the single success probability is a fallback only."
                 )
 
-            portfolio = _build_portfolio(
+            candidate_portfolio = _build_portfolio(
                 product_df,
                 model_cfg,
                 stage_mapping=stage_mapping,
                 overwrite_defaults=st.session_state.get("stage_mapping_overwrite", False),
                 detail_tables=detail_tables,
             )
-            if portfolio is None:
+            (
+                model_cfg,
+                portfolio,
+                valuation_result,
+                validation_issues,
+                used_saved_outputs,
+            ) = _resolve_valuation_context(model_cfg, candidate_portfolio)
+            if candidate_portfolio is None:
                 st.info("Add at least one product with a name to run valuations.")
+                if used_saved_outputs:
+                    st.caption(
+                        "Downstream tabs continue to show the last successful run until a new valid portfolio is available."
+                    )
             else:
-                validation_issues = validate_portfolio(portfolio)
                 if validation_issues:
                     st.error("Validation issues detected:")
                     for issue in validation_issues:
                         st.write(f"- {issue}")
-                    st.session_state.pop("model_config", None)
-                    st.session_state.pop("portfolio", None)
-                    st.session_state.pop("valuation_result", None)
-                    portfolio = None
-                    valuation_result = None
+                    if used_saved_outputs:
+                        st.warning(
+                            "Current edits are invalid. Financial statements, analytics, scenarios, VC helper, and RAG continue to use the last successful valuation."
+                        )
+                    else:
+                        st.info(
+                            "Fix the validation issues above to populate the downstream tabs for the current configuration."
+                        )
                 else:
-                    valuation_result = ValuationEngine(portfolio).run()
-                    st.session_state["model_config"] = model_cfg
-                    st.session_state["portfolio"] = portfolio
-                    st.session_state["valuation_result"] = valuation_result
                     st.success(
                         f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
                     )

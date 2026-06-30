@@ -22,6 +22,7 @@ from streamlit_app import (
     _consume_pending_panel_state,
     _pending_panel_state_key,
     _render_row_selector,
+    _resolve_valuation_context,
     _stage_mapping_row_warnings,
     _set_dataframe_cell,
 )
@@ -256,6 +257,54 @@ class StreamlitHelperTests(unittest.TestCase):
         self.assertEqual(list(result.columns), ["Year", "Predicted multiple"])
         self.assertEqual(len(result), 4)
         self.assertTrue(pd.api.types.is_numeric_dtype(result["Predicted multiple"]))
+
+    def test_resolve_valuation_context_reuses_saved_outputs_on_validation_failure(self) -> None:
+        saved_model_cfg = object()
+        saved_portfolio = object()
+        saved_result = object()
+        candidate_model_cfg = object()
+        candidate_portfolio = object()
+        session_state = {
+            "model_config": saved_model_cfg,
+            "portfolio": saved_portfolio,
+            "valuation_result": saved_result,
+        }
+
+        with patch("streamlit_app.st.session_state", session_state), patch(
+            "streamlit_app.validate_portfolio", return_value=["invalid weights"]
+        ):
+            model_cfg, portfolio, valuation_result, validation_issues, used_saved_outputs = (
+                _resolve_valuation_context(candidate_model_cfg, candidate_portfolio)
+            )
+
+        self.assertIs(model_cfg, saved_model_cfg)
+        self.assertIs(portfolio, saved_portfolio)
+        self.assertIs(valuation_result, saved_result)
+        self.assertEqual(validation_issues, ["invalid weights"])
+        self.assertTrue(used_saved_outputs)
+
+    def test_resolve_valuation_context_persists_successful_run(self) -> None:
+        candidate_model_cfg = object()
+        candidate_portfolio = object()
+        valuation_result = object()
+        session_state = {}
+
+        with patch("streamlit_app.st.session_state", session_state), patch(
+            "streamlit_app.validate_portfolio", return_value=[]
+        ), patch("streamlit_app.ValuationEngine") as engine_cls:
+            engine_cls.return_value.run.return_value = valuation_result
+            model_cfg, portfolio, resolved_result, validation_issues, used_saved_outputs = (
+                _resolve_valuation_context(candidate_model_cfg, candidate_portfolio)
+            )
+
+        self.assertIs(model_cfg, candidate_model_cfg)
+        self.assertIs(portfolio, candidate_portfolio)
+        self.assertIs(resolved_result, valuation_result)
+        self.assertEqual(validation_issues, [])
+        self.assertFalse(used_saved_outputs)
+        self.assertIs(session_state["model_config"], candidate_model_cfg)
+        self.assertIs(session_state["portfolio"], candidate_portfolio)
+        self.assertIs(session_state["valuation_result"], valuation_result)
 
     def test_render_row_selector_preserves_selected_vaccine_row_across_reruns(self) -> None:
         df = pd.DataFrame(
