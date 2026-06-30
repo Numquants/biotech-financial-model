@@ -16,6 +16,7 @@ from streamlit_app import (
     _build_investor_waterfall,
     _build_lender_metrics,
     _build_portfolio,
+    _machine_learning_multiple,
     _build_probability_preview,
     _default_stage_schedule_mapping,
     _consume_pending_panel_state,
@@ -238,6 +239,23 @@ class StreamlitHelperTests(unittest.TestCase):
             any("Validation issues detected:" in element.value for element in app.error),
             [element.value for element in app.error],
         )
+
+    def test_machine_learning_multiple_handles_object_numeric_inputs(self) -> None:
+        cons = pd.DataFrame(
+            {
+                "revenue": ["1000000", "1200000", "1500000", "1800000"],
+                "ebitda": ["150000", "200000", "260000", "320000"],
+            },
+            index=[2024, 2025, 2026, 2027],
+        )
+
+        result = _machine_learning_multiple(cons)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(list(result.columns), ["Year", "Predicted multiple"])
+        self.assertEqual(len(result), 4)
+        self.assertTrue(pd.api.types.is_numeric_dtype(result["Predicted multiple"]))
 
     def test_render_row_selector_preserves_selected_vaccine_row_across_reruns(self) -> None:
         df = pd.DataFrame(

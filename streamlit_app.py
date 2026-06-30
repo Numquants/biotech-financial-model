@@ -3597,21 +3597,27 @@ def _cluster_products(val_result) -> Optional[pd.DataFrame]:
 
 
 def _machine_learning_multiple(cons: pd.DataFrame) -> Optional[pd.DataFrame]:
-    if LinearRegression is None or cons.empty:
+    if LinearRegression is None or cons.empty or "revenue" not in cons.columns or "ebitda" not in cons.columns:
         return None
-    growth = cons["revenue"].pct_change().fillna(0.0)
+    revenue = pd.to_numeric(cons["revenue"], errors="coerce")
+    ebitda = pd.to_numeric(cons["ebitda"], errors="coerce")
+    if revenue.isna().all() or ebitda.isna().all():
+        return None
+    growth = revenue.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
     features = pd.DataFrame(
         {
-            "Revenue": cons["revenue"],
-            "EBITDA": cons["ebitda"],
+            "Revenue": revenue,
+            "EBITDA": ebitda,
             "Growth": growth,
         }
     )
     features = features.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    multiples = (cons["ebitda"].rolling(3).mean().fillna(method="bfill") + 1) / 1_000_000
+    multiples = ((ebitda.rolling(3, min_periods=1).mean().bfill()) + 1.0) / 1_000_000
+    if multiples.isna().all():
+        return None
     model = LinearRegression()
-    model.fit(features.values, multiples.values)
-    pred = model.predict(features.values)
+    model.fit(features.to_numpy(dtype=float), multiples.to_numpy(dtype=float))
+    pred = model.predict(features.to_numpy(dtype=float))
     return pd.DataFrame({"Year": cons.index, "Predicted multiple": pred})
 
 
