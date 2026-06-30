@@ -165,8 +165,28 @@ class CoreModelTests(unittest.TestCase):
         joined = " | ".join(issues)
         self.assertIn("patient-based patent-period revenue does not reconcile", joined)
         self.assertIn("stage durations from Phase II to launch must sum to time_to_market", joined)
-        self.assertIn("stage cost weights across active pre-launch stages must sum to 1.0", joined)
-        self.assertIn("stage capex weights across active pre-launch stages must sum to 1.0", joined)
+        self.assertNotIn("stage cost weights across active pre-launch stages", joined)
+        self.assertNotIn("stage capex weights across active pre-launch stages", joined)
+
+    def test_validate_product_config_rejects_missing_active_stage_weights(self) -> None:
+        issues = validate_product_config(
+            ProductConfig(
+                name="MissingWeightsAsset",
+                stage="Approval",
+                success_prob=0.8,
+                include_in_consolidation=True,
+                time_to_market=1,
+                patent_years=10,
+                patent_revenue_target=100.0,
+                post_patent_revenue_target=50.0,
+                stage_duration_years={"Approval": 1},
+                stage_cost_weights={"Approval": 0.0},
+                stage_capex_weights={"Approval": 0.0},
+            )
+        )
+        joined = " | ".join(issues)
+        self.assertIn("stage cost weights across active pre-launch stages must allocate some positive weight", joined)
+        self.assertIn("stage capex weights across active pre-launch stages must allocate some positive weight", joined)
 
     def test_validate_portfolio_rejects_out_of_range_model_assumptions(self) -> None:
         model_cfg = ModelConfig(

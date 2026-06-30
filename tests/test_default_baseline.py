@@ -22,7 +22,7 @@ from streamlit_app import (
     _default_vaccine_sales_table,
     _sanitize_product_records,
 )
-from valuation_codex_package.core import ModelConfig, ValuationEngine
+from valuation_codex_package.core import ModelConfig, ValuationEngine, validate_portfolio
 
 
 def _default_model_config() -> ModelConfig:
@@ -75,6 +75,18 @@ class DefaultBaselineTests(unittest.TestCase):
         self.assertGreater(cons["fcff_after_wc"].iloc[-1], 0.0)
         self.assertGreater(financed_cash["Ending cash balance"].min(), 0.0)
         self.assertAlmostEqual(financed_cash["Debt closing balance"].iloc[-1], 0.0, places=6)
+
+    def test_default_product_baseline_passes_validation(self) -> None:
+        model_cfg = _default_model_config()
+        portfolio = _build_portfolio(
+            _default_products(),
+            model_cfg,
+            stage_mapping=_default_stage_schedule_mapping(),
+            overwrite_defaults=False,
+            detail_tables={},
+        )
+
+        self.assertEqual(validate_portfolio(portfolio), [])
 
     def test_detailed_default_baseline_stays_profitable(self) -> None:
         model_cfg = _default_model_config()

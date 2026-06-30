@@ -7925,53 +7925,58 @@ def main() -> None:
                     st.error("Validation issues detected:")
                     for issue in validation_issues:
                         st.write(f"- {issue}")
-                    st.stop()
-                valuation_result = ValuationEngine(portfolio).run()
-                st.session_state["model_config"] = model_cfg
-                st.session_state["portfolio"] = portfolio
-                st.session_state["valuation_result"] = valuation_result
-                st.success(
-                    f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
-                )
-                financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
-                equity_bridge = financing_outputs["equity_bridge"]
-                lender_metrics = financing_outputs["lender_metrics"]
-                investor_waterfall = financing_outputs["investor_waterfall"]
-                st.markdown("**Enterprise-to-equity bridge**")
-                st.dataframe(equity_bridge.style.format({"Amount": "{:,.0f}"}), use_container_width=True)
-                if not lender_metrics.empty:
-                    st.markdown("**Lender metrics**")
-                    st.dataframe(
-                        lender_metrics.style.format(
-                            {
-                                "CFADS": "{:,.0f}",
-                                "Debt service": "{:,.0f}",
-                                "DSCR": "{:.2f}",
-                                "LLCR": "{:.2f}",
-                                "PLCR": "{:.2f}",
-                                "Minimum cash reserve": "{:,.0f}",
-                                "Cash reserve headroom": "{:,.0f}",
-                            }
-                        ),
-                        use_container_width=True,
+                    st.session_state.pop("model_config", None)
+                    st.session_state.pop("portfolio", None)
+                    st.session_state.pop("valuation_result", None)
+                    portfolio = None
+                    valuation_result = None
+                else:
+                    valuation_result = ValuationEngine(portfolio).run()
+                    st.session_state["model_config"] = model_cfg
+                    st.session_state["portfolio"] = portfolio
+                    st.session_state["valuation_result"] = valuation_result
+                    st.success(
+                        f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
                     )
-                if not investor_waterfall.empty:
-                    st.markdown("**Investor waterfall**")
-                    st.dataframe(
-                        investor_waterfall.style.format(
-                            {
-                                "Ownership %": "{:.1%}",
-                                "Investment": "{:,.0f}",
-                                "Converted value": "{:,.0f}",
-                                "Preference claim": "{:,.0f}",
-                                "Preference paid": "{:,.0f}",
-                                "Common pool allocation": "{:,.0f}",
-                                "Total proceeds": "{:,.0f}",
-                                "MOIC": "{:.2f}",
-                            }
-                        ),
-                        use_container_width=True,
-                    )
+                    financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
+                    equity_bridge = financing_outputs["equity_bridge"]
+                    lender_metrics = financing_outputs["lender_metrics"]
+                    investor_waterfall = financing_outputs["investor_waterfall"]
+                    st.markdown("**Enterprise-to-equity bridge**")
+                    st.dataframe(equity_bridge.style.format({"Amount": "{:,.0f}"}), use_container_width=True)
+                    if not lender_metrics.empty:
+                        st.markdown("**Lender metrics**")
+                        st.dataframe(
+                            lender_metrics.style.format(
+                                {
+                                    "CFADS": "{:,.0f}",
+                                    "Debt service": "{:,.0f}",
+                                    "DSCR": "{:.2f}",
+                                    "LLCR": "{:.2f}",
+                                    "PLCR": "{:.2f}",
+                                    "Minimum cash reserve": "{:,.0f}",
+                                    "Cash reserve headroom": "{:,.0f}",
+                                }
+                            ),
+                            use_container_width=True,
+                        )
+                    if not investor_waterfall.empty:
+                        st.markdown("**Investor waterfall**")
+                        st.dataframe(
+                            investor_waterfall.style.format(
+                                {
+                                    "Ownership %": "{:.1%}",
+                                    "Investment": "{:,.0f}",
+                                    "Converted value": "{:,.0f}",
+                                    "Preference claim": "{:,.0f}",
+                                    "Preference paid": "{:,.0f}",
+                                    "Common pool allocation": "{:,.0f}",
+                                    "Total proceeds": "{:,.0f}",
+                                    "MOIC": "{:.2f}",
+                                }
+                            ),
+                            use_container_width=True,
+                        )
 
     with financial_tab:
         st.subheader("Financial statements")

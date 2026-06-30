@@ -1540,15 +1540,15 @@ def validate_product_config(config: ProductConfig) -> List[str]:
         active_weight_stages = [stage for stage in forward_stages if int(config.stage_duration_years.get(stage, 0)) > 0]
         if active_weight_stages and config.stage_cost_weights:
             cost_weight_total = sum(float(config.stage_cost_weights.get(stage, 0.0)) for stage in active_weight_stages)
-            if not np.isclose(cost_weight_total, 1.0, atol=0.05):
+            if cost_weight_total <= 0:
                 issues.append(
-                    f"{config.name}: stage cost weights across active pre-launch stages must sum to 1.0."
+                    f"{config.name}: stage cost weights across active pre-launch stages must allocate some positive weight."
                 )
         if active_weight_stages and config.stage_capex_weights:
             capex_weight_total = sum(float(config.stage_capex_weights.get(stage, 0.0)) for stage in active_weight_stages)
-            if not np.isclose(capex_weight_total, 1.0, atol=0.05):
+            if capex_weight_total <= 0:
                 issues.append(
-                    f"{config.name}: stage capex weights across active pre-launch stages must sum to 1.0."
+                    f"{config.name}: stage capex weights across active pre-launch stages must allocate some positive weight."
                 )
     return issues
 

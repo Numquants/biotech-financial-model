@@ -224,6 +224,21 @@ class StreamlitHelperTests(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0, app.exception)
 
+    def test_streamlit_app_default_run_populates_outputs(self) -> None:
+        app = AppTest.from_file(str(APP_PATH))
+
+        app.run(timeout=120)
+
+        self.assertEqual(len(app.exception), 0, app.exception)
+        self.assertTrue(
+            any("Run complete:" in element.value for element in app.success),
+            [element.value for element in app.success],
+        )
+        self.assertFalse(
+            any("Validation issues detected:" in element.value for element in app.error),
+            [element.value for element in app.error],
+        )
+
     def test_render_row_selector_preserves_selected_vaccine_row_across_reruns(self) -> None:
         df = pd.DataFrame(
             [
