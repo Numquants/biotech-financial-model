@@ -20,10 +20,12 @@ from streamlit_app import (
     _default_stage_schedule_mapping,
     _consume_pending_panel_state,
     _pending_panel_state_key,
+    _render_row_selector,
     _stage_mapping_row_warnings,
     _set_dataframe_cell,
 )
 from valuation_codex_package.core import ModelConfig, Product, ProductConfig, Portfolio, ValuationEngine
+from valuation_codex_package.ui_state import _validate_selection
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
@@ -50,6 +52,37 @@ class StreamlitHelperTests(unittest.TestCase):
 
         self.assertIsNone(df.at[0, "Year"])
         self.assertEqual(str(df["Year"].dtype), "object")
+
+    def test_render_row_selector_keeps_selected_vaccine_id(self) -> None:
+        df = pd.DataFrame(
+            [
+                {"ID_vaccine": "VAC-001", "Vaccine name": "AgSeed-101"},
+                {"ID_vaccine": "VAC-002", "Vaccine name": "BioYield-Plus"},
+            ]
+        )
+        session_state = {}
+        captured: dict[str, object] = {}
+        select_key = "vaccine_revenue_table_row_select"
+
+        def _fake_selectbox(_label, *, options, format_func, index, key):
+            captured["options"] = list(options)
+            captured["labels"] = [format_func(option) for option in options]
+            captured["index"] = index
+            session_state[key] = options[1]
+            return options[1]
+
+        with patch("streamlit_app.st.session_state", session_state), patch(
+            "streamlit_app.st.selectbox", side_effect=_fake_selectbox
+        ):
+            selected_idx = _render_row_selector(df, select_key, "ID_vaccine", "Vaccine name")
+            _validate_selection(df, select_key, "ID_vaccine")
+
+        self.assertEqual(selected_idx, 1)
+        self.assertEqual(captured["options"], ["VAC-001", "VAC-002"])
+        self.assertEqual(captured["labels"], ["VAC-001 - AgSeed-101", "VAC-002 - BioYield-Plus"])
+        self.assertEqual(captured["index"], 0)
+        self.assertEqual(session_state[select_key], "VAC-002")
+        self.assertNotIn(f"{select_key}_pending", session_state)
 
     def test_enterprise_to_equity_bridge_applies_cash_debt_and_new_equity(self) -> None:
         model_cfg = ModelConfig(first_year=2024, n_years=1, discount_rate=0.0, tax_rate=0.0, ev_ebitda_multiple=0.0)

@@ -1285,23 +1285,27 @@ def _render_row_selector(
         st.session_state.pop(_pending_selection_key(select_key), None)
         return None
 
-    options = list(df.index)
+    row_indexes = list(df.index)
+    option_values = [_row_identifier(df, idx, id_column) for idx in row_indexes]
+    option_to_index = dict(zip(option_values, row_indexes))
     selected_id = pending if pending is not None else st.session_state.get(select_key)
     default_idx = _resolve_selected_index_from_value(df, selected_id, id_column)
-    if default_idx is None or default_idx not in options:
-        default_idx = options[0]
+    if default_idx is None or default_idx not in row_indexes:
+        default_idx = row_indexes[0]
+    default_value = _row_identifier(df, default_idx, id_column)
 
-    def _format(idx):
+    def _format(option_value):
+        idx = option_to_index.get(option_value, default_idx)
         return _format_row_label(df, idx, id_column, name_column)
 
-    selected = st.selectbox(
+    selected_value = st.selectbox(
         "Select row",
-        options=options,
+        options=option_values,
         format_func=_format,
-        index=options.index(default_idx),
+        index=option_values.index(default_value),
         key=select_key,
     )
-    return selected
+    return option_to_index.get(selected_value, default_idx)
 
 
 def _render_yearly_increment_helper(
