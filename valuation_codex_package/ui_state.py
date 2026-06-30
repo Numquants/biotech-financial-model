@@ -62,6 +62,38 @@ def _row_identifier(df: pd.DataFrame, idx: int, id_column: Optional[str]) -> obj
     return idx
 
 
+def _selection_identity_column(
+    df: pd.DataFrame,
+    id_column: Optional[str],
+    name_column: Optional[str] = None,
+) -> Optional[str]:
+    if id_column and id_column in df.columns:
+        return id_column
+    if name_column and name_column in df.columns:
+        return name_column
+    return None
+
+
+def _coerce_selection_value(
+    df: pd.DataFrame,
+    selected_id: Optional[object],
+    id_column: Optional[str],
+) -> Optional[object]:
+    if selected_id is None or df.empty:
+        return selected_id
+    if id_column and id_column in df.columns and selected_id is not None:
+        matches = df.index[df[id_column] == selected_id]
+        if len(matches):
+            return selected_id
+    if isinstance(selected_id, str) and selected_id.isdigit():
+        selected_index = int(selected_id)
+        if selected_index in df.index:
+            return _row_identifier(df, selected_index, id_column)
+    if selected_id in df.index:
+        return _row_identifier(df, selected_id, id_column)
+    return selected_id
+
+
 def _resolve_selected_index_from_value(
     df: pd.DataFrame,
     selected_id: Optional[object],
@@ -69,6 +101,7 @@ def _resolve_selected_index_from_value(
 ) -> Optional[int]:
     if df.empty:
         return None
+    selected_id = _coerce_selection_value(df, selected_id, id_column)
     if id_column and id_column in df.columns and selected_id is not None:
         matches = df.index[df[id_column] == selected_id]
         if len(matches):
@@ -82,25 +115,28 @@ def _resolve_selected_index(
     df: pd.DataFrame,
     select_key: str,
     id_column: Optional[str],
+    name_column: Optional[str] = None,
 ) -> Optional[int]:
-    return _resolve_selected_index_from_value(df, st.session_state.get(select_key), id_column)
+    identity_column = _selection_identity_column(df, id_column, name_column)
+    return _resolve_selected_index_from_value(df, st.session_state.get(select_key), identity_column)
 
 
 def _validate_selection(
     df: pd.DataFrame,
     select_key: str,
     id_column: Optional[str],
+    name_column: Optional[str] = None,
 ) -> None:
     if df.empty:
         _set_pending_selection(select_key, None)
         return
 
-    selected_idx = _resolve_selected_index(df, select_key, id_column)
+    identity_column = _selection_identity_column(df, id_column, name_column)
+    selected_idx = _resolve_selected_index(df, select_key, id_column, name_column)
     if selected_idx is None:
-        _set_pending_selection(select_key, _row_identifier(df, df.index[0], id_column))
+        _set_pending_selection(select_key, _row_identifier(df, df.index[0], identity_column))
         return
 
-    selected_id = _row_identifier(df, selected_idx, id_column)
+    selected_id = _row_identifier(df, selected_idx, identity_column)
     if selected_id != st.session_state.get(select_key):
         _set_pending_selection(select_key, selected_id)
-

@@ -84,6 +84,37 @@ class StreamlitHelperTests(unittest.TestCase):
         self.assertEqual(session_state[select_key], "VAC-002")
         self.assertNotIn(f"{select_key}_pending", session_state)
 
+    def test_render_row_selector_migrates_name_based_legacy_index_state(self) -> None:
+        df = pd.DataFrame(
+            [
+                {"name": "AgSeed-101", "stage": "Discovery"},
+                {"name": "BioYield-Plus", "stage": "Preclinical"},
+            ]
+        )
+        session_state = {"product_table_row_select": 0}
+        captured: dict[str, object] = {}
+        select_key = "product_table_row_select"
+
+        def _fake_selectbox(_label, *, options, format_func, index, key):
+            captured["options"] = list(options)
+            captured["labels"] = [format_func(option) for option in options]
+            captured["index"] = index
+            session_state[key] = options[1]
+            return options[1]
+
+        with patch("streamlit_app.st.session_state", session_state), patch(
+            "streamlit_app.st.selectbox", side_effect=_fake_selectbox
+        ):
+            selected_idx = _render_row_selector(df, select_key, None, "name")
+            _validate_selection(df, select_key, None, "name")
+
+        self.assertEqual(selected_idx, 1)
+        self.assertEqual(captured["options"], ["AgSeed-101", "BioYield-Plus"])
+        self.assertEqual(captured["labels"], ["AgSeed-101", "BioYield-Plus"])
+        self.assertEqual(captured["index"], 0)
+        self.assertEqual(session_state[select_key], "BioYield-Plus")
+        self.assertNotIn(f"{select_key}_pending", session_state)
+
     def test_enterprise_to_equity_bridge_applies_cash_debt_and_new_equity(self) -> None:
         model_cfg = ModelConfig(first_year=2024, n_years=1, discount_rate=0.0, tax_rate=0.0, ev_ebitda_multiple=0.0)
         product_cfg = ProductConfig(
@@ -192,6 +223,45 @@ class StreamlitHelperTests(unittest.TestCase):
         app.run(timeout=120)
 
         self.assertEqual(len(app.exception), 0, app.exception)
+
+    def test_render_row_selector_preserves_selected_vaccine_row_across_reruns(self) -> None:
+        df = pd.DataFrame(
+            [
+                {"ID_vaccine": "VAC-001", "Vaccine name": "AgSeed-101"},
+                {"ID_vaccine": "VAC-002", "Vaccine name": "BioYield-Plus"},
+            ]
+        )
+        session_state = {"vaccine_development_table_row_select": 0}
+        select_key = "vaccine_development_table_row_select"
+        captured_indexes: list[int] = []
+
+        def _first_selectbox(_label, *, options, format_func, index, key):
+            captured_indexes.append(index)
+            session_state[key] = options[1]
+            return options[1]
+
+        def _second_selectbox(_label, *, options, format_func, index, key):
+            captured_indexes.append(index)
+            session_state[key] = options[index]
+            return options[index]
+
+        with patch("streamlit_app.st.session_state", session_state), patch(
+            "streamlit_app.st.selectbox", side_effect=_first_selectbox
+        ):
+            first_selected_idx = _render_row_selector(df, select_key, "ID_vaccine", "Vaccine name")
+            _validate_selection(df, select_key, "ID_vaccine", "Vaccine name")
+
+        with patch("streamlit_app.st.session_state", session_state), patch(
+            "streamlit_app.st.selectbox", side_effect=_second_selectbox
+        ):
+            second_selected_idx = _render_row_selector(df, select_key, "ID_vaccine", "Vaccine name")
+            _validate_selection(df, select_key, "ID_vaccine", "Vaccine name")
+
+        self.assertEqual(first_selected_idx, 1)
+        self.assertEqual(second_selected_idx, 1)
+        self.assertEqual(captured_indexes, [0, 1])
+        self.assertEqual(session_state[select_key], "VAC-002")
+        self.assertNotIn(f"{select_key}_pending", session_state)
 
     def test_probability_preview_flags_stage_transition_source(self) -> None:
         product_df = pd.DataFrame(

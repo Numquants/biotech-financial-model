@@ -67,6 +67,7 @@ from valuation_codex_package.ui_state import (
     _resolve_selected_index,
     _resolve_selected_index_from_value,
     _row_identifier,
+    _selection_identity_column,
     _set_pending_panel_state,
     _set_pending_selection,
     _validate_selection,
@@ -98,6 +99,27 @@ SELECTOR_OPTIONS = [
     "Aggressive expansion",
     "Defensive posture",
 ]
+
+DEBT_REPAYMENT_LABELS = {
+    "straight_line": "Straight-line",
+    "sculpted_dscr": "Sculpted to DSCR",
+    "bullet": "Bullet maturity",
+    "manual": "Manual schedule",
+}
+DEBT_REPAYMENT_CODES = {label: code for code, label in DEBT_REPAYMENT_LABELS.items()}
+
+DISCOUNT_TIMING_LABELS = {
+    "year_end": "Year-end",
+    "mid_year": "Mid-year",
+    "year_0": "Year-0",
+}
+DISCOUNT_TIMING_CODES = {label: code for code, label in DISCOUNT_TIMING_LABELS.items()}
+
+TERMINAL_METHOD_LABELS = {
+    "exit_multiple": "Exit multiple",
+    "perpetuity_growth": "Perpetuity growth",
+}
+TERMINAL_METHOD_CODES = {label: code for code, label in TERMINAL_METHOD_LABELS.items()}
 
 
 def _inject_app_theme() -> None:
@@ -1286,13 +1308,16 @@ def _render_row_selector(
         return None
 
     row_indexes = list(df.index)
-    option_values = [_row_identifier(df, idx, id_column) for idx in row_indexes]
+    identity_column = _selection_identity_column(df, id_column, name_column)
+    option_values = [_row_identifier(df, idx, identity_column) for idx in row_indexes]
     option_to_index = dict(zip(option_values, row_indexes))
     selected_id = pending if pending is not None else st.session_state.get(select_key)
-    default_idx = _resolve_selected_index_from_value(df, selected_id, id_column)
+    default_idx = _resolve_selected_index_from_value(df, selected_id, identity_column)
     if default_idx is None or default_idx not in row_indexes:
         default_idx = row_indexes[0]
-    default_value = _row_identifier(df, default_idx, id_column)
+    default_value = _row_identifier(df, default_idx, identity_column)
+    if st.session_state.get(select_key) != default_value:
+        st.session_state[select_key] = default_value
 
     def _format(option_value):
         idx = option_to_index.get(option_value, default_idx)
@@ -1593,6 +1618,7 @@ def _add_row_via_form(
     blank_row_factory: Callable[[pd.DataFrame], Dict],
     select_key: str,
     id_column: Optional[str],
+    name_column: Optional[str],
 ) -> pd.DataFrame:
     """Render an add-row form so users can insert new entries with custom values."""
 
@@ -1610,7 +1636,8 @@ def _add_row_via_form(
     if new_row is not None:
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         st.session_state[section_key] = df
-        _set_pending_selection(select_key, _row_identifier(df, df.index[-1], id_column))
+        identity_column = _selection_identity_column(df, id_column, name_column)
+        _set_pending_selection(select_key, _row_identifier(df, df.index[-1], identity_column))
         _set_pending_panel_state(_panel_state_key(section_key, "add"), False)
         st.success("Row added")
     return st.session_state.get(section_key, df)
@@ -1622,6 +1649,7 @@ def _remove_selected_row(
     selected_idx: Optional[int],
     select_key: str,
     id_column: Optional[str],
+    name_column: Optional[str],
 ) -> pd.DataFrame:
     """Delete the selected row when the user confirms the removal."""
 
@@ -1636,7 +1664,8 @@ def _remove_selected_row(
             df = df.drop(index=selected_idx).reset_index(drop=True)
             st.session_state[section_key] = df
             if not df.empty:
-                _set_pending_selection(select_key, _row_identifier(df, df.index[-1], id_column))
+                identity_column = _selection_identity_column(df, id_column, name_column)
+                _set_pending_selection(select_key, _row_identifier(df, df.index[-1], identity_column))
             else:
                 _set_pending_selection(select_key, None)
             st.success("Row removed")
@@ -1678,7 +1707,14 @@ def _render_product_assumption_table(
             help="Open the add-row form.",
         )
     with action_cols[2]:
-        df = _remove_selected_row(session_key, df, selected_idx, select_key, id_column)
+        df = _remove_selected_row(
+            session_key,
+            df,
+            selected_idx,
+            select_key,
+            id_column,
+            name_column,
+        )
     with action_cols[3]:
         increment_open = st.checkbox(
             "Yearly Increment",
@@ -1695,7 +1731,7 @@ def _render_product_assumption_table(
 
     if add_open:
         st.caption("Add a new row with all fields visible before it is inserted into the table.")
-        df = _add_row_via_form(session_key, df, blank_row_factory, select_key, id_column)
+        df = _add_row_via_form(session_key, df, blank_row_factory, select_key, id_column, name_column)
 
     if increment_open:
         st.caption("Apply a fixed yearly change or compounded growth from the selected row onward.")
@@ -1714,7 +1750,7 @@ def _render_product_assumption_table(
     if session_key == "vaccine_sales_table":
         edited_df = _recompute_vaccine_sales_implied_revenue(edited_df)
     st.session_state[session_key] = edited_df
-    _validate_selection(edited_df, select_key, id_column)
+    _validate_selection(edited_df, select_key, id_column, name_column)
     return edited_df
 
 
@@ -4661,9 +4697,16 @@ def _apply_cash_flow_assumptions(
 
 
 def _financing_settings_from_state() -> Dict[str, object]:
+    repayment_mode_value = str(
+        st.session_state.get("debt_repayment_mode", DEBT_REPAYMENT_LABELS["straight_line"])
+        or DEBT_REPAYMENT_LABELS["straight_line"]
+    )
+    repayment_mode = DEBT_REPAYMENT_CODES.get(repayment_mode_value, repayment_mode_value)
+    if repayment_mode not in DEBT_REPAYMENT_LABELS:
+        repayment_mode = "straight_line"
     return {
         "interest_rate": float(st.session_state.get("debt_interest_rate", 0.0)),
-        "repayment_mode": str(st.session_state.get("debt_repayment_mode", "straight_line") or "straight_line"),
+        "repayment_mode": repayment_mode,
         "grace_years": int(st.session_state.get("debt_grace_years", 0) or 0),
         "target_dscr": float(st.session_state.get("debt_target_dscr", 1.3) or 1.3),
         "minimum_cash_reserve": float(st.session_state.get("minimum_cash_reserve", 0.0) or 0.0),
@@ -6999,24 +7042,26 @@ def main() -> None:
                             key="debt_interest_rate",
                         )
                     with debt_cols[1]:
-                        repayment_options = ["straight_line", "sculpted_dscr", "bullet", "manual"]
                         current_repayment_mode = str(
-                            st.session_state.get("debt_repayment_mode", "straight_line") or "straight_line"
+                            st.session_state.get(
+                                "debt_repayment_mode",
+                                DEBT_REPAYMENT_LABELS["straight_line"],
+                            )
+                            or DEBT_REPAYMENT_LABELS["straight_line"]
                         )
-                        if current_repayment_mode not in repayment_options:
-                            current_repayment_mode = "straight_line"
-                        debt_repayment_mode = st.selectbox(
+                        if current_repayment_mode in DEBT_REPAYMENT_LABELS:
+                            current_repayment_mode = DEBT_REPAYMENT_LABELS[current_repayment_mode]
+                        if current_repayment_mode not in DEBT_REPAYMENT_CODES:
+                            current_repayment_mode = DEBT_REPAYMENT_LABELS["straight_line"]
+                        if st.session_state.get("debt_repayment_mode") != current_repayment_mode:
+                            st.session_state["debt_repayment_mode"] = current_repayment_mode
+                        debt_repayment_mode_label = st.selectbox(
                             "Repayment mode",
-                            options=repayment_options,
-                            format_func=lambda value: {
-                                "straight_line": "Straight-line",
-                                "sculpted_dscr": "Sculpted to DSCR",
-                                "bullet": "Bullet maturity",
-                                "manual": "Manual schedule",
-                            }.get(value, value),
-                            index=repayment_options.index(current_repayment_mode),
+                            options=list(DEBT_REPAYMENT_CODES.keys()),
+                            index=list(DEBT_REPAYMENT_CODES.keys()).index(current_repayment_mode),
                             key="debt_repayment_mode",
                         )
+                        debt_repayment_mode = DEBT_REPAYMENT_CODES[debt_repayment_mode_label]
                     with debt_cols[2]:
                         debt_grace_years = st.number_input(
                             "Grace years",
@@ -7115,29 +7160,22 @@ def main() -> None:
                 with col_a:
                     discount_rate = st.slider("Discount rate", min_value=0.02, max_value=0.30, value=0.10)
                 with col_b:
-                    discount_timing = st.selectbox(
+                    discount_timing_label = st.selectbox(
                         "Discount timing",
-                        options=["year_end", "mid_year", "year_0"],
-                        format_func=lambda option: {
-                            "year_end": "Year-end",
-                            "mid_year": "Mid-year",
-                            "year_0": "Year-0",
-                        }.get(option, option),
+                        options=list(DISCOUNT_TIMING_CODES.keys()),
                     )
+                    discount_timing = DISCOUNT_TIMING_CODES[discount_timing_label]
                 with col_c:
                     risk_buffer = st.number_input(
                         "Additional risk premium", min_value=0.0, max_value=0.20, value=0.0, step=0.01
                     )
                 dcf_cols = st.columns(3)
                 with dcf_cols[0]:
-                    terminal_method = st.selectbox(
+                    terminal_method_label = st.selectbox(
                         "Terminal method",
-                        options=["exit_multiple", "perpetuity_growth"],
-                        format_func=lambda option: {
-                            "exit_multiple": "Exit multiple",
-                            "perpetuity_growth": "Perpetuity growth",
-                        }.get(option, option),
+                        options=list(TERMINAL_METHOD_CODES.keys()),
                     )
+                    terminal_method = TERMINAL_METHOD_CODES[terminal_method_label]
                 with dcf_cols[1]:
                     ev_multiple = st.slider("Terminal EV/EBITDA multiple", 2.0, 30.0, 8.0)
                 with dcf_cols[2]:
