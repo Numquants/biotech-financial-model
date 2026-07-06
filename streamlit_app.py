@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import io
 import importlib
@@ -13,7 +14,7 @@ from functools import lru_cache
 from io import BytesIO
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -6850,33 +6851,201 @@ def _render_rag_assistant_page() -> None:
         )
 
 
-def _resolve_valuation_context(
-    candidate_model_cfg: ModelConfig,
-    candidate_portfolio: Portfolio | None,
-) -> tuple[ModelConfig | None, Portfolio | None, object | None, list[str], bool]:
-    saved_model_cfg = st.session_state.get("model_config")
-    saved_portfolio = st.session_state.get("portfolio")
-    saved_valuation_result = st.session_state.get("valuation_result")
-    used_saved_outputs = saved_valuation_result is not None
+_BIOTECH_BASE_VALUATION_CACHE_KEY = "_biotech_base_valuation_cache"
+_BIOTECH_LAZY_ANALYTICS_CACHE_KEY = "_biotech_lazy_analytics_cache"
+_BIOTECH_LAZY_ANALYTICS_STATE_KEY = "_biotech_lazy_analytics_state"
+_BIOTECH_RUN_STATE_KEY = "biotech_last_run_state"
 
-    if candidate_portfolio is None:
-        return saved_model_cfg, saved_portfolio, saved_valuation_result, [], used_saved_outputs
 
-    validation_issues = validate_portfolio(candidate_portfolio)
-    if validation_issues:
-        return (
-            saved_model_cfg,
-            saved_portfolio,
-            saved_valuation_result,
-            validation_issues,
-            used_saved_outputs,
+def _copy_state_value(value: Any) -> Any:
+    if isinstance(value, pd.DataFrame):
+        return value.copy(deep=True)
+    if isinstance(value, pd.Series):
+        return value.copy(deep=True)
+    if isinstance(value, dict):
+        return {key: _copy_state_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_state_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_state_value(item) for item in value)
+    return value
+
+
+def _normalize_for_signature(value: Any) -> Any:
+    if isinstance(value, pd.DataFrame):
+        frame = value.copy()
+        frame.columns = [str(column) for column in frame.columns]
+        normalized_records = frame.where(pd.notna(frame), None).to_dict(orient="records")
+        return {
+            "columns": list(frame.columns),
+            "records": [_normalize_for_signature(record) for record in normalized_records],
+        }
+    if isinstance(value, pd.Series):
+        series = value.copy()
+        normalized_values = [
+            None if pd.isna(item) else _normalize_for_signature(item)
+            for item in series.tolist()
+        ]
+        return {
+            "name": str(series.name) if series.name is not None else None,
+            "index": [_normalize_for_signature(idx) for idx in series.index.tolist()],
+            "values": normalized_values,
+        }
+    if hasattr(value, "item") and callable(getattr(value, "item", None)):
+        try:
+            return _normalize_for_signature(value.item())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_for_signature(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_signature(item) for item in value]
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if pd.isna(value):
+            return None
+        return round(float(value), 12)
+    if isinstance(value, (str, int, bool)):
+        return value
+    if hasattr(value, "__dataclass_fields__"):
+        return _normalize_for_signature(asdict(value))
+    return str(value)
+
+
+def _stable_signature(payload: Any) -> str:
+    normalized = _normalize_for_signature(payload)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _capture_biotech_input_state(model_cfg: Optional[ModelConfig] = None) -> Dict[str, Any]:
+    if model_cfg is None:
+        model_cfg = st.session_state.get("draft_model_config") or st.session_state.get("model_config")
+
+    state: Dict[str, Any] = {}
+    if model_cfg is not None:
+        state["model_config"] = asdict(model_cfg)
+
+    for key in _BIOTECH_DF_KEYS + _BIOTECH_SCALAR_KEYS:
+        if key in st.session_state:
+            state[key] = _copy_state_value(st.session_state.get(key))
+
+    return state
+
+
+@contextmanager
+def _use_biotech_state_snapshot(snapshot: Optional[Dict[str, Any]]):
+    if not snapshot:
+        yield
+        return
+
+    sentinel = object()
+    previous_values = {key: _copy_state_value(st.session_state.get(key, sentinel)) for key in snapshot}
+    try:
+        for key, value in snapshot.items():
+            st.session_state[key] = _copy_state_value(value)
+        yield
+    finally:
+        for key, previous in previous_values.items():
+            if previous is sentinel:
+                st.session_state.pop(key, None)
+            else:
+                st.session_state[key] = previous
+
+
+def _build_biotech_valuation_signature(model_cfg: ModelConfig, portfolio: Portfolio) -> str:
+    return _stable_signature(
+        {
+            "model_config": asdict(model_cfg),
+            "products": [asdict(product.config) for product in portfolio.products],
+        }
+    )
+
+
+def _run_cached_base_valuation(model_cfg: ModelConfig, portfolio: Portfolio) -> Tuple[str, ValuationResult]:
+    signature = _build_biotech_valuation_signature(model_cfg, portfolio)
+    cache: Dict[str, ValuationResult] = st.session_state.setdefault(
+        _BIOTECH_BASE_VALUATION_CACHE_KEY,
+        {},
+    )
+    if signature not in cache:
+        cache[signature] = ValuationEngine(portfolio).run()
+    return signature, cache[signature]
+
+
+def _lazy_analytics_cache() -> Dict[str, Dict[str, Any]]:
+    return st.session_state.setdefault(_BIOTECH_LAZY_ANALYTICS_CACHE_KEY, {})
+
+
+def _lazy_analytics_state() -> Dict[str, Dict[str, Any]]:
+    return st.session_state.setdefault(_BIOTECH_LAZY_ANALYTICS_STATE_KEY, {})
+
+
+def _run_cached_lazy_analytics(
+    section: str,
+    *,
+    base_signature: Optional[str],
+    params: Any,
+    compute: Callable[[], Any],
+) -> Any:
+    normalized_params = _normalize_for_signature(params)
+    cache_key = _stable_signature(
+        {
+            "section": section,
+            "base_signature": base_signature,
+            "params": normalized_params,
+        }
+    )
+    section_cache = _lazy_analytics_cache().setdefault(section, {})
+    if cache_key not in section_cache:
+        section_cache[cache_key] = compute()
+    _lazy_analytics_state()[section] = {
+        "base_signature": base_signature,
+        "params": normalized_params,
+        "cache_key": cache_key,
+    }
+    return section_cache[cache_key]
+
+
+def _last_lazy_result(section: str) -> Any:
+    state = _lazy_analytics_state().get(section)
+    if not state:
+        return None
+    return _lazy_analytics_cache().get(section, {}).get(state.get("cache_key"))
+
+
+def _lazy_result_is_stale(section: str, *, base_signature: Optional[str], params: Any) -> bool:
+    state = _lazy_analytics_state().get(section)
+    if not state:
+        return False
+    return state.get("base_signature") != base_signature or state.get("params") != _normalize_for_signature(params)
+
+
+def _render_lazy_result_notice(
+    section: str,
+    *,
+    label: str,
+    base_signature: Optional[str],
+    params: Any,
+    run_label: str,
+) -> None:
+    last_result = _last_lazy_result(section)
+    if last_result is None:
+        st.info(f"Press {run_label} to compute {label.lower()}.")
+        return
+    if _lazy_result_is_stale(section, base_signature=base_signature, params=params):
+        st.warning(
+            f"Showing the last computed {label.lower()}. Press {run_label} to refresh for the current inputs."
         )
 
-    valuation_result = ValuationEngine(candidate_portfolio).run()
-    st.session_state["model_config"] = candidate_model_cfg
-    st.session_state["portfolio"] = candidate_portfolio
-    st.session_state["valuation_result"] = valuation_result
-    return candidate_model_cfg, candidate_portfolio, valuation_result, [], False
+
+def _current_model_run_signature() -> Optional[str]:
+    return st.session_state.get("biotech_draft_signature")
+
 
 def main() -> None:
     st.set_page_config(
@@ -6890,7 +7059,9 @@ def main() -> None:
 
     model_cfg: ModelConfig | None = st.session_state.get("model_config")
     portfolio: Portfolio | None = st.session_state.get("portfolio")
-    valuation_result = st.session_state.get("valuation_result")
+    valuation_result: ValuationResult | None = st.session_state.get("valuation_result")
+    draft_defaults = st.session_state.get("draft_model_config") or model_cfg or ModelConfig()
+    run_state = st.session_state.get(_BIOTECH_RUN_STATE_KEY)
 
     section_labels = [
         "Model configuration",
@@ -7287,12 +7458,33 @@ def main() -> None:
             with st.expander("General assumptions", expanded=True):
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    first_year = st.number_input("First forecast year", value=2024)
-                    n_years = st.number_input("Number of years", min_value=5, max_value=40, value=25)
-                    currency = st.text_input("Currency", value="USD")
+                    first_year = st.number_input(
+                        "First forecast year",
+                        value=int(getattr(draft_defaults, "first_year", 2024)),
+                    )
+                    n_years = st.number_input(
+                        "Number of years",
+                        min_value=5,
+                        max_value=40,
+                        value=int(getattr(draft_defaults, "n_years", 25)),
+                    )
+                    currency = st.text_input(
+                        "Currency",
+                        value=str(getattr(draft_defaults, "currency", "USD") or "USD"),
+                    )
                 with col2:
-                    tax_rate = st.slider("Tax rate", min_value=0.0, max_value=0.35, value=0.25)
-                    wc_pct = st.slider("Working capital (% sales)", 0.0, 0.3, 0.08)
+                    tax_rate = st.slider(
+                        "Tax rate",
+                        min_value=0.0,
+                        max_value=0.35,
+                        value=float(getattr(draft_defaults, "tax_rate", 0.25) or 0.25),
+                    )
+                    wc_pct = st.slider(
+                        "Working capital (% sales)",
+                        0.0,
+                        0.3,
+                        float(getattr(draft_defaults, "working_capital_pct_sales", 0.08) or 0.08),
+                    )
                 with col3:
                     inflation = st.number_input("Inflation assumption", value=0.02, min_value=0.0, max_value=0.25, step=0.005)
                     base_fx = st.text_input("Reporting FX pair", value="USD/EUR")
@@ -7702,7 +7894,12 @@ def main() -> None:
             with st.expander("Risk-adjusted DCF valuation method - assumptions"):
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
-                    discount_rate = st.slider("Discount rate", min_value=0.02, max_value=0.30, value=0.10)
+                    discount_rate = st.slider(
+                        "Discount rate",
+                        min_value=0.02,
+                        max_value=0.30,
+                        value=float(getattr(draft_defaults, "discount_rate", 0.10) or 0.10),
+                    )
                 with col_b:
                     discount_timing_label = st.selectbox(
                         "Discount timing",
@@ -7721,19 +7918,24 @@ def main() -> None:
                     )
                     terminal_method = TERMINAL_METHOD_CODES[terminal_method_label]
                 with dcf_cols[1]:
-                    ev_multiple = st.slider("Terminal EV/EBITDA multiple", 2.0, 30.0, 8.0)
+                    ev_multiple = st.slider(
+                        "Terminal EV/EBITDA multiple",
+                        2.0,
+                        30.0,
+                        float(getattr(draft_defaults, "ev_ebitda_multiple", 8.0) or 8.0),
+                    )
                 with dcf_cols[2]:
                     perpetuity_growth = st.slider(
                         "Perpetuity growth rate",
                         min_value=0.0,
                         max_value=0.08,
-                        value=0.02,
+                        value=float(getattr(draft_defaults, "perpetuity_growth_rate", 0.02) or 0.02),
                         step=0.005,
                     )
                 opening_nol_balance = st.number_input(
                     "Opening NOL balance",
                     min_value=0.0,
-                    value=float(st.session_state.get("opening_nol_balance", 0.0)),
+                    value=float(getattr(draft_defaults, "opening_nol_balance", 0.0) or 0.0),
                     step=5_000_000.0,
                     format="%0.0f",
                     key="opening_nol_balance",
@@ -7863,7 +8065,7 @@ def main() -> None:
                 st.write("Active selectors:", ", ".join(selector_choices) or "None")
 
             effective_discount_rate = float(min(0.40, discount_rate + risk_buffer))
-            model_cfg = ModelConfig(
+            draft_model_cfg = ModelConfig(
                 first_year=int(first_year),
                 n_years=int(n_years),
                 currency=currency,
@@ -8435,7 +8637,7 @@ def main() -> None:
             st.session_state["product_table"] = product_df
             probability_preview = _build_probability_preview(
                 product_df,
-                model_cfg,
+                draft_model_cfg,
                 stage_mapping,
                 overwrite_defaults=st.session_state.get("stage_mapping_overwrite", False),
                 detail_tables=detail_tables,
@@ -8454,90 +8656,134 @@ def main() -> None:
                     "Stage-transition curves are authoritative when present; the single success probability is a fallback only."
                 )
 
-            candidate_portfolio = _build_portfolio(
+            draft_portfolio = _build_portfolio(
                 product_df,
-                model_cfg,
+                draft_model_cfg,
                 stage_mapping=stage_mapping,
                 overwrite_defaults=st.session_state.get("stage_mapping_overwrite", False),
                 detail_tables=detail_tables,
             )
-            (
-                model_cfg,
-                portfolio,
-                valuation_result,
-                validation_issues,
-                used_saved_outputs,
-            ) = _resolve_valuation_context(model_cfg, candidate_portfolio)
-            if candidate_portfolio is None:
-                st.info("Add at least one product with a name to run valuations.")
-                if used_saved_outputs:
-                    st.caption(
-                        "Downstream tabs continue to show the last successful run until a new valid portfolio is available."
-                    )
+            validation_issues: List[str] = []
+            if draft_portfolio is not None:
+                validation_issues = validate_portfolio(draft_portfolio)
+
+            st.session_state["draft_model_config"] = draft_model_cfg
+            draft_input_state = _capture_biotech_input_state(draft_model_cfg)
+            draft_signature = _stable_signature(draft_input_state)
+            st.session_state["biotech_draft_signature"] = draft_signature
+
+            last_run_signature = st.session_state.get("biotech_last_run_signature")
+            if valuation_result is not None and last_run_signature is None and not validation_issues:
+                last_run_signature = draft_signature
+                st.session_state["biotech_last_run_signature"] = draft_signature
+                if run_state is None:
+                    run_state = draft_input_state
+                    st.session_state[_BIOTECH_RUN_STATE_KEY] = _copy_state_value(draft_input_state)
+
+            results_stale = bool(valuation_result is None or last_run_signature != draft_signature)
+            if draft_portfolio is None or validation_issues:
+                results_stale = valuation_result is not None or bool(validation_issues)
+            st.session_state["biotech_results_stale"] = results_stale
+
+            if draft_portfolio is None:
+                st.info("Add at least one product with a name to prepare a new run.")
             else:
                 if validation_issues:
                     st.error("Validation issues detected:")
                     for issue in validation_issues:
                         st.write(f"- {issue}")
-                    if used_saved_outputs:
-                        st.warning(
-                            "Current edits are invalid. Financial statements, analytics, scenarios, VC helper, and RAG continue to use the last successful valuation."
-                        )
-                    else:
-                        st.info(
-                            "Fix the validation issues above to populate the downstream tabs for the current configuration."
-                        )
+                elif valuation_result is None:
+                    st.info("Draft inputs are ready. Press Run Model to compute the valuation.")
+                elif results_stale:
+                    st.warning(
+                        "Showing the last computed valuation. Press Run Model to refresh for the current draft inputs."
+                    )
                 else:
                     st.success(
-                        f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
+                        f"Results are current for this draft: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
                     )
-                    financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
-                    equity_bridge = financing_outputs["equity_bridge"]
-                    lender_metrics = financing_outputs["lender_metrics"]
-                    investor_waterfall = financing_outputs["investor_waterfall"]
-                    st.markdown("**Enterprise-to-equity bridge**")
-                    st.dataframe(equity_bridge.style.format({"Amount": "{:,.0f}"}), use_container_width=True)
-                    if not lender_metrics.empty:
-                        st.markdown("**Lender metrics**")
-                        st.dataframe(
-                            lender_metrics.style.format(
-                                {
-                                    "CFADS": "{:,.0f}",
-                                    "Debt service": "{:,.0f}",
-                                    "DSCR": "{:.2f}",
-                                    "LLCR": "{:.2f}",
-                                    "PLCR": "{:.2f}",
-                                    "Minimum cash reserve": "{:,.0f}",
-                                    "Cash reserve headroom": "{:,.0f}",
-                                }
-                            ),
-                            use_container_width=True,
-                        )
-                    if not investor_waterfall.empty:
-                        st.markdown("**Investor waterfall**")
-                        st.dataframe(
-                            investor_waterfall.style.format(
-                                {
-                                    "Ownership %": "{:.1%}",
-                                    "Investment": "{:,.0f}",
-                                    "Converted value": "{:,.0f}",
-                                    "Preference claim": "{:,.0f}",
-                                    "Preference paid": "{:,.0f}",
-                                    "Common pool allocation": "{:,.0f}",
-                                    "Total proceeds": "{:,.0f}",
-                                    "MOIC": "{:.2f}",
-                                }
-                            ),
-                            use_container_width=True,
-                        )
 
+            run_clicked = st.button(
+                "Run Model",
+                key="biotech_run_model",
+                type="primary",
+                disabled=draft_portfolio is None or bool(validation_issues),
+            )
+            if run_clicked and draft_portfolio is not None and not validation_issues:
+                valuation_cache_signature, computed_result = _run_cached_base_valuation(
+                    draft_model_cfg,
+                    draft_portfolio,
+                )
+                previous_run_signature = st.session_state.get("biotech_last_run_signature")
+                st.session_state["model_config"] = draft_model_cfg
+                st.session_state["portfolio"] = draft_portfolio
+                st.session_state["valuation_result"] = computed_result
+                st.session_state["biotech_last_run_signature"] = draft_signature
+                st.session_state["biotech_last_run_valuation_signature"] = valuation_cache_signature
+                st.session_state["biotech_last_run_version"] = int(
+                    st.session_state.get("biotech_last_run_version", 0)
+                ) + 1
+                st.session_state["biotech_results_stale"] = False
+                st.session_state[_BIOTECH_RUN_STATE_KEY] = _copy_state_value(draft_input_state)
+                if previous_run_signature != draft_signature:
+                    st.session_state.pop("financial_excel_bytes", None)
+                model_cfg = draft_model_cfg
+                portfolio = draft_portfolio
+                valuation_result = computed_result
+                run_state = st.session_state[_BIOTECH_RUN_STATE_KEY]
+                st.success(
+                    f"Run complete: enterprise value = {valuation_result.enterprise_value:,.0f} {model_cfg.currency}."
+                )
+
+            if valuation_result is not None and model_cfg is not None:
+                with _use_biotech_state_snapshot(run_state):
+                    financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
+                equity_bridge = financing_outputs["equity_bridge"]
+                lender_metrics = financing_outputs["lender_metrics"]
+                investor_waterfall = financing_outputs["investor_waterfall"]
+                st.markdown("**Enterprise-to-equity bridge**")
+                st.dataframe(equity_bridge.style.format({"Amount": "{:,.0f}"}), use_container_width=True)
+                if not lender_metrics.empty:
+                    st.markdown("**Lender metrics**")
+                    st.dataframe(
+                        lender_metrics.style.format(
+                            {
+                                "CFADS": "{:,.0f}",
+                                "Debt service": "{:,.0f}",
+                                "DSCR": "{:.2f}",
+                                "LLCR": "{:.2f}",
+                                "PLCR": "{:.2f}",
+                                "Minimum cash reserve": "{:,.0f}",
+                                "Cash reserve headroom": "{:,.0f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
+                if not investor_waterfall.empty:
+                    st.markdown("**Investor waterfall**")
+                    st.dataframe(
+                        investor_waterfall.style.format(
+                            {
+                                "Ownership %": "{:.1%}",
+                                "Investment": "{:,.0f}",
+                                "Converted value": "{:,.0f}",
+                                "Preference claim": "{:,.0f}",
+                                "Preference paid": "{:,.0f}",
+                                "Common pool allocation": "{:,.0f}",
+                                "Total proceeds": "{:,.0f}",
+                                "MOIC": "{:.2f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
     if active_section == "Financial statements":
         st.subheader("Financial statements")
         if valuation_result is None or model_cfg is None:
-            st.info("Run the model configuration tab to populate the statements.")
+            st.info("Press Run Model in the configuration tab to populate the statements.")
         else:
             cons = valuation_result.consolidated
-            financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
+            with _use_biotech_state_snapshot(run_state):
+                financing_outputs = _build_financing_outputs(valuation_result, model_cfg)
             perf_df = financing_outputs["financial_performance"]
             position_df = financing_outputs["financial_position"]
             cash_flow_df = financing_outputs["cash_flows"]
@@ -8804,99 +9050,144 @@ def main() -> None:
                 launch_delay_years=int(launch_delay),
                 stage_slippage_years=stage_slippage,
             )
-            scen_results = ScenarioEngine(portfolio).run_scenarios([scenario])
-
-            scenario_result = _evaluate_portfolio_shock(
-                portfolio,
-                revenue_multiplier=float(rev_mult),
-                cost_multiplier=float(cost_mult),
-                discount_shift=float(dr_shift),
-                success_prob_multiplier=float(prob_mult),
-                launch_delay_years=int(launch_delay),
-                stage_slippage_years=stage_slippage,
+            base_run_signature = st.session_state.get("biotech_last_run_signature")
+            scenario_params = {
+                "name": scenario.name,
+                "revenue_multiplier": float(rev_mult),
+                "cost_multiplier": float(cost_mult),
+                "discount_rate_shift": float(dr_shift),
+                "success_prob_multiplier": float(prob_mult),
+                "launch_delay_years": int(launch_delay),
+                "stage_slippage_years": stage_slippage,
+            }
+            _render_lazy_result_notice(
+                "dashboard_scenario_current",
+                label="scenario analysis",
+                base_signature=base_run_signature,
+                params=scenario_params,
+                run_label="Run scenario analysis",
             )
-            if scenario_result is not None and valuation_result is not None:
-                base_cons = valuation_result.consolidated
-                base_rnpv = valuation_result.rnpv
-                base_ebitda = base_cons["ebitda"].sum()
-                scen_cons = scenario_result.consolidated
-                scen_rnpv = scenario_result.rnpv
-                scen_ebitda = scen_cons["ebitda"].sum()
-                delta_cols = st.columns(4)
-                delta_cols[0].metric("Scenario rNPV", f"{scen_rnpv:,.0f}", f"{scen_rnpv - base_rnpv:+,.0f}")
-                delta_cols[1].metric(
-                    "Scenario EBITDA",
-                    f"{scen_ebitda:,.0f}",
-                    f"{scen_ebitda - base_ebitda:+,.0f}",
-                )
-                delta_cols[2].metric(
-                    "Revenue delta",
-                    f"{scen_cons['revenue'].sum():,.0f}",
-                    f"{scen_cons['revenue'].sum() - base_cons['revenue'].sum():+,.0f}",
-                )
-                delta_cols[3].metric(
-                    "FCFF delta",
-                    f"{scen_cons['fcff_after_wc'].sum():,.0f}",
-                    f"{scen_cons['fcff_after_wc'].sum() - base_cons['fcff_after_wc'].sum():+,.0f}",
-                )
+            if st.button("Run scenario analysis", key="scenario_run_current"):
+                def _compute_current_scenario() -> Dict[str, Any]:
+                    scen_results = ScenarioEngine(portfolio).run_scenarios([scenario])
+                    scenario_result = _evaluate_portfolio_shock(
+                        portfolio,
+                        revenue_multiplier=float(rev_mult),
+                        cost_multiplier=float(cost_mult),
+                        discount_shift=float(dr_shift),
+                        success_prob_multiplier=float(prob_mult),
+                        launch_delay_years=int(launch_delay),
+                        stage_slippage_years=stage_slippage,
+                    )
 
-                def _funding_required_from_cons(cons_df: pd.DataFrame) -> float:
-                    uses_total = float(st.session_state.get("uses_total", 0.0))
-                    burn_total = 0.0
-                    wc_total = 0.0
-                    if "fcff_after_wc" in cons_df.columns:
-                        burn_total = float((-cons_df["fcff_after_wc"].clip(upper=0)).sum())
-                    if "delta_wc" in cons_df.columns:
-                        wc_total = float((-cons_df["delta_wc"].clip(upper=0)).sum())
-                    return uses_total + burn_total + wc_total
+                    def _funding_required_from_cons(cons_df: pd.DataFrame) -> float:
+                        uses_total = float(st.session_state.get("uses_total", 0.0))
+                        burn_total = 0.0
+                        wc_total = 0.0
+                        if "fcff_after_wc" in cons_df.columns:
+                            burn_total = float((-cons_df["fcff_after_wc"].clip(upper=0)).sum())
+                        if "delta_wc" in cons_df.columns:
+                            wc_total = float((-cons_df["delta_wc"].clip(upper=0)).sum())
+                        return uses_total + burn_total + wc_total
 
-                component_rows = [
-                    {
-                        "Component": "Revenue",
-                        "Base": float(base_cons["revenue"].sum()),
-                        "Scenario": float(scen_cons["revenue"].sum()),
-                    },
-                    {
-                        "Component": "R&D cash burn",
-                        "Base": float((-base_cons.get("rd_cash", pd.Series(0.0, index=base_cons.index))).sum()),
-                        "Scenario": float((-scen_cons.get("rd_cash", pd.Series(0.0, index=scen_cons.index))).sum()),
-                    },
-                    {
-                        "Component": "CAPEX cash",
-                        "Base": float((-base_cons.get("capex_cash", pd.Series(0.0, index=base_cons.index))).sum()),
-                        "Scenario": float((-scen_cons.get("capex_cash", pd.Series(0.0, index=scen_cons.index))).sum()),
-                    },
-                    {
-                        "Component": "Equity required (uses + burn + WC)",
-                        "Base": _funding_required_from_cons(base_cons),
-                        "Scenario": _funding_required_from_cons(scen_cons),
-                    },
-                ]
-                component_df = pd.DataFrame(component_rows)
-                component_df["Delta"] = component_df["Scenario"] - component_df["Base"]
-                st.markdown("**Scenario deltas by component**")
-                st.dataframe(
-                    component_df.style.format(
-                        {"Base": "{:,.0f}", "Scenario": "{:,.0f}", "Delta": "{:+,.0f}"}
-                    ),
-                    use_container_width=True,
-                )
-
-                overlay_df = pd.DataFrame(
-                    {
-                        "Base revenue": base_cons["revenue"],
-                        "Scenario revenue": scen_cons["revenue"],
-                        "Base EBITDA": base_cons["ebitda"],
-                        "Scenario EBITDA": scen_cons["ebitda"],
-                        "Base FCFF": base_cons["fcff_after_wc"],
-                        "Scenario FCFF": scen_cons["fcff_after_wc"],
+                    bundle: Dict[str, Any] = {
+                        "scen_results": scen_results,
+                        "scenario_result": scenario_result,
                     }
-                )
-                st.markdown("**Scenario overlay vs base**")
-                st.line_chart(overlay_df)
+                    if scenario_result is not None and valuation_result is not None:
+                        base_cons = valuation_result.consolidated
+                        scen_cons = scenario_result.consolidated
+                        component_rows = [
+                            {
+                                "Component": "Revenue",
+                                "Base": float(base_cons["revenue"].sum()),
+                                "Scenario": float(scen_cons["revenue"].sum()),
+                            },
+                            {
+                                "Component": "R&D cash burn",
+                                "Base": float((-base_cons.get("rd_cash", pd.Series(0.0, index=base_cons.index))).sum()),
+                                "Scenario": float((-scen_cons.get("rd_cash", pd.Series(0.0, index=scen_cons.index))).sum()),
+                            },
+                            {
+                                "Component": "CAPEX cash",
+                                "Base": float((-base_cons.get("capex_cash", pd.Series(0.0, index=base_cons.index))).sum()),
+                                "Scenario": float((-scen_cons.get("capex_cash", pd.Series(0.0, index=scen_cons.index))).sum()),
+                            },
+                            {
+                                "Component": "Equity required (uses + burn + WC)",
+                                "Base": _funding_required_from_cons(base_cons),
+                                "Scenario": _funding_required_from_cons(scen_cons),
+                            },
+                        ]
+                        component_df = pd.DataFrame(component_rows)
+                        component_df["Delta"] = component_df["Scenario"] - component_df["Base"]
+                        overlay_df = pd.DataFrame(
+                            {
+                                "Base revenue": base_cons["revenue"],
+                                "Scenario revenue": scen_cons["revenue"],
+                                "Base EBITDA": base_cons["ebitda"],
+                                "Scenario EBITDA": scen_cons["ebitda"],
+                                "Base FCFF": base_cons["fcff_after_wc"],
+                                "Scenario FCFF": scen_cons["fcff_after_wc"],
+                            }
+                        )
+                        bundle["component_df"] = component_df
+                        bundle["overlay_df"] = overlay_df
+                    return bundle
 
-            st.markdown("**Scenario result**")
-            st.dataframe(scen_results.style.format({"rnpv": "{:.0f}", "ebitda_value": "{:.0f}"}))
+                with _use_biotech_state_snapshot(run_state):
+                    _run_cached_lazy_analytics(
+                        "dashboard_scenario_current",
+                        base_signature=base_run_signature,
+                        params=scenario_params,
+                        compute=_compute_current_scenario,
+                    )
+
+            scenario_bundle = _last_lazy_result("dashboard_scenario_current")
+            if scenario_bundle is not None:
+                scenario_result = scenario_bundle.get("scenario_result")
+                if scenario_result is not None and valuation_result is not None:
+                    base_cons = valuation_result.consolidated
+                    base_rnpv = valuation_result.rnpv
+                    base_ebitda = base_cons["ebitda"].sum()
+                    scen_cons = scenario_result.consolidated
+                    scen_rnpv = scenario_result.rnpv
+                    scen_ebitda = scen_cons["ebitda"].sum()
+                    delta_cols = st.columns(4)
+                    delta_cols[0].metric("Scenario rNPV", f"{scen_rnpv:,.0f}", f"{scen_rnpv - base_rnpv:+,.0f}")
+                    delta_cols[1].metric(
+                        "Scenario EBITDA",
+                        f"{scen_ebitda:,.0f}",
+                        f"{scen_ebitda - base_ebitda:+,.0f}",
+                    )
+                    delta_cols[2].metric(
+                        "Revenue delta",
+                        f"{scen_cons['revenue'].sum():,.0f}",
+                        f"{scen_cons['revenue'].sum() - base_cons['revenue'].sum():+,.0f}",
+                    )
+                    delta_cols[3].metric(
+                        "FCFF delta",
+                        f"{scen_cons['fcff_after_wc'].sum():,.0f}",
+                        f"{scen_cons['fcff_after_wc'].sum() - base_cons['fcff_after_wc'].sum():+,.0f}",
+                    )
+                    component_df = scenario_bundle.get("component_df")
+                    if component_df is not None:
+                        st.markdown("**Scenario deltas by component**")
+                        st.dataframe(
+                            component_df.style.format(
+                                {"Base": "{:,.0f}", "Scenario": "{:,.0f}", "Delta": "{:+,.0f}"}
+                            ),
+                            use_container_width=True,
+                        )
+                    overlay_df = scenario_bundle.get("overlay_df")
+                    if overlay_df is not None:
+                        st.markdown("**Scenario overlay vs base**")
+                        st.line_chart(overlay_df)
+
+                st.markdown("**Scenario result**")
+                st.dataframe(
+                    scenario_bundle["scen_results"].style.format({"rnpv": "{:.0f}", "ebitda_value": "{:.0f}"})
+                )
 
             st.markdown("**Multi-scenario comparison**")
             if "scenario_basket" not in st.session_state:
@@ -8916,22 +9207,50 @@ def main() -> None:
                 st.session_state["scenario_basket"] = []
 
             basket = st.session_state.get("scenario_basket", [])
-            if basket:
-                scenario_list = [Scenario(**entry) for entry in basket]
-                basket_results = ScenarioEngine(portfolio).run_scenarios(scenario_list)
-                st.dataframe(
-                    basket_results.style.format({"rnpv": "{:.0f}", "ebitda_value": "{:.0f}"})
+            basket_params = {"basket": basket}
+            _render_lazy_result_notice(
+                "dashboard_scenario_basket",
+                label="scenario comparison",
+                base_signature=base_run_signature,
+                params=basket_params,
+                run_label="Refresh scenario comparison",
+            )
+            if basket and st.button("Refresh scenario comparison", key="scenario_run_basket"):
+                _run_cached_lazy_analytics(
+                    "dashboard_scenario_basket",
+                    base_signature=base_run_signature,
+                    params=basket_params,
+                    compute=lambda: ScenarioEngine(portfolio).run_scenarios([Scenario(**entry) for entry in basket]),
                 )
+            basket_results = _last_lazy_result("dashboard_scenario_basket")
+            if basket_results is not None and basket:
+                st.dataframe(basket_results.style.format({"rnpv": "{:.0f}", "ebitda_value": "{:.0f}"}))
             else:
                 st.caption("Add scenarios to compare multiple cases side-by-side.")
 
             st.markdown("**Tornado sensitivity (interactive)**")
             if valuation_result is not None:
-                tornado_df = _tornado_dataframe(portfolio, valuation_result.rnpv)
-                if tornado_df.empty:
-                    st.info("Unable to compute tornado deltas.")
-                else:
-                    st.dataframe(tornado_df.style.format({"rnpv": "{:.0f}", "Delta": "{:+,.0f}"}))
+                tornado_params = {"base_rnpv": float(valuation_result.rnpv)}
+                _render_lazy_result_notice(
+                    "dashboard_tornado",
+                    label="tornado sensitivity",
+                    base_signature=base_run_signature,
+                    params=tornado_params,
+                    run_label="Refresh tornado sensitivity",
+                )
+                if st.button("Refresh tornado sensitivity", key="dashboard_run_tornado"):
+                    _run_cached_lazy_analytics(
+                        "dashboard_tornado",
+                        base_signature=base_run_signature,
+                        params=tornado_params,
+                        compute=lambda: _tornado_dataframe(portfolio, valuation_result.rnpv),
+                    )
+                tornado_df = _last_lazy_result("dashboard_tornado")
+                if tornado_df is not None:
+                    if tornado_df.empty:
+                        st.info("Unable to compute tornado deltas.")
+                    else:
+                        st.dataframe(tornado_df.style.format({"rnpv": "{:.0f}", "Delta": "{:+,.0f}"}))
             else:
                 st.info("Run a valuation to unlock tornado sensitivities.")
 
@@ -8957,6 +9276,7 @@ def main() -> None:
         else:
             cons = valuation_result.consolidated
             base_rnpv = valuation_result.rnpv
+            base_run_signature = st.session_state.get("biotech_last_run_signature")
             ratios = _build_ratio_table(cons)
             st.markdown("**Margin & intensity analysis**")
             st.dataframe(ratios.style.format("{:.1%}"))
@@ -9095,61 +9415,107 @@ def main() -> None:
                     "Manufacturing costs": (manufacturing_delta, "cost"),
                     "Clinical success": (clinical_delta, "productivity"),
                 }
-                sens_df = _run_sensitivity_matrix(portfolio, drivers)
-                if sens_df.empty:
-                    st.info("Not enough data to compute sensitivities.")
-                else:
-                    st.dataframe(sens_df.style.format({"rNPV": "{:.0f}", "Delta vs base": "{:+,.0f}"}))
+                sens_params = {"drivers": drivers}
+                _render_lazy_result_notice(
+                    "analytics_sensitivity_stress",
+                    label="sensitivity and stress testing",
+                    base_signature=base_run_signature,
+                    params=sens_params,
+                    run_label="Run sensitivity & stress",
+                )
+                if st.button("Run sensitivity & stress", key="analytics_run_sensitivity_stress"):
+                    def _compute_sensitivity_and_stress() -> Dict[str, Any]:
+                        sens_df = _run_sensitivity_matrix(portfolio, drivers)
+                        severe_cases = [
+                            ("Regulatory delay", 0.7, 1.2, 0.03, 0.9),
+                            ("Trial failure", 0.6, 1.3, 0.04, 0.75),
+                            ("Pricing squeeze", 0.5, 1.05, 0.02, 0.95),
+                        ]
+                        stress_rows = []
+                        for name, rev_mult, cost_mult, dr_shift, prob_mult in severe_cases:
+                            result = _evaluate_portfolio_shock(
+                                portfolio,
+                                revenue_multiplier=rev_mult,
+                                cost_multiplier=cost_mult,
+                                discount_shift=dr_shift,
+                                success_prob_multiplier=prob_mult,
+                            )
+                            if result is None:
+                                continue
+                            stress_rows.append(
+                                {
+                                    "Scenario": name,
+                                    "rNPV": result.rnpv,
+                                    "EBITDA impact": result.consolidated["ebitda"].sum(),
+                                }
+                            )
+                        stress_df = pd.DataFrame(stress_rows)
+                        return {"sens_df": sens_df, "stress_df": stress_df}
 
-                st.markdown("**Scenario stress testing**")
-                severe_cases = [
-                    ("Regulatory delay", 0.7, 1.2, 0.03, 0.9),
-                    ("Trial failure", 0.6, 1.3, 0.04, 0.75),
-                    ("Pricing squeeze", 0.5, 1.05, 0.02, 0.95),
-                ]
-                stress_rows = []
-                for name, rev_mult, cost_mult, dr_shift, prob_mult in severe_cases:
-                    result = _evaluate_portfolio_shock(
-                        portfolio,
-                        revenue_multiplier=rev_mult,
-                        cost_multiplier=cost_mult,
-                        discount_shift=dr_shift,
-                        success_prob_multiplier=prob_mult,
+                    _run_cached_lazy_analytics(
+                        "analytics_sensitivity_stress",
+                        base_signature=base_run_signature,
+                        params=sens_params,
+                        compute=_compute_sensitivity_and_stress,
                     )
-                    if result is None:
-                        continue
-                    stress_rows.append(
-                        {
-                            "Scenario": name,
-                            "rNPV": result.rnpv,
-                            "EBITDA impact": result.consolidated["ebitda"].sum(),
+
+                sensitivity_bundle = _last_lazy_result("analytics_sensitivity_stress")
+                if sensitivity_bundle is not None:
+                    sens_df = sensitivity_bundle["sens_df"]
+                    if sens_df.empty:
+                        st.info("Not enough data to compute sensitivities.")
+                    else:
+                        st.dataframe(sens_df.style.format({"rNPV": "{:.0f}", "Delta vs base": "{:+,.0f}"}))
+
+                    st.markdown("**Scenario stress testing**")
+                    stress_df = sensitivity_bundle["stress_df"]
+                    if not stress_df.empty:
+                        numeric_cols = stress_df.select_dtypes(include="number").columns
+                        formatter = {
+                            col: "{:+,.0f}" if "impact" in col.lower() else "{:,}"
+                            for col in numeric_cols
                         }
-                    )
-                if stress_rows:
-                    stress_df = pd.DataFrame(stress_rows)
-                    numeric_cols = stress_df.select_dtypes(include="number").columns
-                    formatter = {col: "{:+,.0f}" if "impact" in col.lower() else "{:,}" for col in numeric_cols}
-                    st.dataframe(stress_df.style.format(formatter))
+                        st.dataframe(stress_df.style.format(formatter))
 
             with st.expander("Trend, seasonality & segmentation", expanded=False):
-                decomp_df = _compute_decomposition(cons)
-                if decomp_df is not None:
-                    st.line_chart(decomp_df)
-                else:
-                    st.info("Need more history to decompose trend/seasonality.")
-
-                seg_df = _build_segmentation_table(valuation_result)
-                if not seg_df.empty:
-                    st.dataframe(
-                        seg_df.style.format({
-                            "Revenue share": "{:.1%}",
-                            "EBITDA margin": "{:.1%}",
-                            "FCFF (PV proxy)": "{:.0f}",
-                        })
+                trend_params = {"section": "trend_segmentation"}
+                _render_lazy_result_notice(
+                    "analytics_trend_segmentation",
+                    label="trend and segmentation insights",
+                    base_signature=base_run_signature,
+                    params=trend_params,
+                    run_label="Refresh trend analysis",
+                )
+                if st.button("Refresh trend analysis", key="analytics_run_trend_segmentation"):
+                    _run_cached_lazy_analytics(
+                        "analytics_trend_segmentation",
+                        base_signature=base_run_signature,
+                        params=trend_params,
+                        compute=lambda: {
+                            "decomp_df": _compute_decomposition(cons),
+                            "seg_df": _build_segmentation_table(valuation_result),
+                        },
                     )
-                    st.bar_chart(seg_df.set_index("Product")["Revenue share"])
-                else:
-                    st.info("Add probability-weighted products to see segmentation insights.")
+                trend_bundle = _last_lazy_result("analytics_trend_segmentation")
+                if trend_bundle is not None:
+                    decomp_df = trend_bundle["decomp_df"]
+                    if decomp_df is not None:
+                        st.line_chart(decomp_df)
+                    else:
+                        st.info("Need more history to decompose trend/seasonality.")
+
+                    seg_df = trend_bundle["seg_df"]
+                    if not seg_df.empty:
+                        st.dataframe(
+                            seg_df.style.format({
+                                "Revenue share": "{:.1%}",
+                                "EBITDA margin": "{:.1%}",
+                                "FCFF (PV proxy)": "{:.0f}",
+                            })
+                        )
+                        st.bar_chart(seg_df.set_index("Product")["Revenue share"])
+                    else:
+                        st.info("Add probability-weighted products to see segmentation insights.")
 
             with st.expander("Monte Carlo & probabilistic valuation", expanded=False):
                 mc_cols = st.columns(4)
@@ -9175,23 +9541,47 @@ def main() -> None:
                 cost_min = cost_bounds[0].number_input("Cost min (uniform)", value=0.8, step=0.05)
                 cost_max = cost_bounds[1].number_input("Cost max (uniform)", value=1.2, step=0.05)
 
-                if st.button("Run Monte Carlo simulation"):
-                    sims = MonteCarloEngine(portfolio).simulate(
-                        n_sims=int(n_sims),
-                        revenue_sigma=float(rev_sigma),
-                        cost_sigma=float(cost_sigma),
-                        revenue_dist=str(rev_dist).lower(),
-                        cost_dist=str(cost_dist).lower(),
-                        revenue_min=float(rev_min),
-                        revenue_max=float(rev_max),
-                        cost_min=float(cost_min),
-                        cost_max=float(cost_max),
-                        launch_delay_sigma=float(launch_delay_sigma),
-                        random_seed=int(seed),
+                mc_params = {
+                    "n_sims": int(n_sims),
+                    "revenue_dist": str(rev_dist).lower(),
+                    "cost_dist": str(cost_dist).lower(),
+                    "revenue_sigma": float(rev_sigma),
+                    "cost_sigma": float(cost_sigma),
+                    "launch_delay_sigma": float(launch_delay_sigma),
+                    "revenue_min": float(rev_min),
+                    "revenue_max": float(rev_max),
+                    "cost_min": float(cost_min),
+                    "cost_max": float(cost_max),
+                    "seed": int(seed),
+                }
+                _render_lazy_result_notice(
+                    "analytics_monte_carlo",
+                    label="Monte Carlo results",
+                    base_signature=base_run_signature,
+                    params=mc_params,
+                    run_label="Run Monte Carlo simulation",
+                )
+                if st.button("Run Monte Carlo simulation", key="analytics_run_monte_carlo"):
+                    _run_cached_lazy_analytics(
+                        "analytics_monte_carlo",
+                        base_signature=base_run_signature,
+                        params=mc_params,
+                        compute=lambda: MonteCarloEngine(portfolio).simulate(
+                            n_sims=int(n_sims),
+                            revenue_sigma=float(rev_sigma),
+                            cost_sigma=float(cost_sigma),
+                            revenue_dist=str(rev_dist).lower(),
+                            cost_dist=str(cost_dist).lower(),
+                            revenue_min=float(rev_min),
+                            revenue_max=float(rev_max),
+                            cost_min=float(cost_min),
+                            cost_max=float(cost_max),
+                            launch_delay_sigma=float(launch_delay_sigma),
+                            random_seed=int(seed),
+                        ),
                     )
-                    st.session_state["mc_results"] = sims
 
-                sims = st.session_state.get("mc_results")
+                sims = _last_lazy_result("analytics_monte_carlo")
                 if sims is not None:
                     st.line_chart(sims.reset_index(drop=True))
                     hist = np.histogram(sims, bins=20)
@@ -9214,15 +9604,33 @@ def main() -> None:
                 what_rev = what_cols[0].slider("Revenue multiplier", 0.4, 2.0, 1.0)
                 what_cost = what_cols[1].slider("Cost multiplier", 0.5, 2.5, 1.0)
                 what_dr = what_cols[2].slider("Discount shift", -0.05, 0.1, 0.0)
-                if st.button("Evaluate what-if case"):
-                    result = _evaluate_portfolio_shock(
-                        portfolio,
-                        revenue_multiplier=float(what_rev),
-                        cost_multiplier=float(what_cost),
-                        discount_shift=float(what_dr),
+                what_if_params = {
+                    "revenue_multiplier": float(what_rev),
+                    "cost_multiplier": float(what_cost),
+                    "discount_shift": float(what_dr),
+                }
+                _render_lazy_result_notice(
+                    "analytics_what_if",
+                    label="what-if case",
+                    base_signature=base_run_signature,
+                    params=what_if_params,
+                    run_label="Evaluate what-if case",
+                )
+                if st.button("Evaluate what-if case", key="analytics_run_what_if"):
+                    _run_cached_lazy_analytics(
+                        "analytics_what_if",
+                        base_signature=base_run_signature,
+                        params=what_if_params,
+                        compute=lambda: _evaluate_portfolio_shock(
+                            portfolio,
+                            revenue_multiplier=float(what_rev),
+                            cost_multiplier=float(what_cost),
+                            discount_shift=float(what_dr),
+                        ),
                     )
-                    if result is not None:
-                        st.success(f"What-if rNPV: {result.rnpv:,.0f}")
+                what_if_result = _last_lazy_result("analytics_what_if")
+                if what_if_result is not None:
+                    st.success(f"What-if rNPV: {what_if_result.rnpv:,.0f}")
 
                 target_rnpv = st.number_input("Target rNPV for goal seek", value=base_rnpv)
                 if st.button("Solve revenue multiplier"):
@@ -9235,61 +9643,96 @@ def main() -> None:
                         st.warning("Goal seek failed—try adjusting the target or assumptions.")
 
             with st.expander("Tornado & spider diagnostics", expanded=False):
-                tornado_df = _tornado_dataframe(portfolio, base_rnpv)
-                if tornado_df.empty:
-                    st.info("Unable to compute tornado deltas.")
-                else:
-                    st.dataframe(tornado_df.style.format({"rNPV": "{:.0f}", "Delta": "{:+,.0f}"}))
-                    if go is not None:
-                        tornado_fig = go.Figure()
-                        pos = tornado_df[tornado_df["Delta"] >= 0]
-                        neg = tornado_df[tornado_df["Delta"] < 0]
-                        tornado_fig.add_trace(
-                            go.Bar(
-                                y=pos["Driver"],
-                                x=pos["Delta"],
-                                orientation="h",
-                                name="Positive",
+                tornado_params = {"base_rnpv": float(base_rnpv)}
+                _render_lazy_result_notice(
+                    "analytics_tornado_spider",
+                    label="tornado and spider diagnostics",
+                    base_signature=base_run_signature,
+                    params=tornado_params,
+                    run_label="Refresh tornado & spider diagnostics",
+                )
+                if st.button("Refresh tornado & spider diagnostics", key="analytics_run_tornado_spider"):
+                    _run_cached_lazy_analytics(
+                        "analytics_tornado_spider",
+                        base_signature=base_run_signature,
+                        params=tornado_params,
+                        compute=lambda: _tornado_dataframe(portfolio, base_rnpv),
+                    )
+                tornado_df = _last_lazy_result("analytics_tornado_spider")
+                if tornado_df is not None:
+                    if tornado_df.empty:
+                        st.info("Unable to compute tornado deltas.")
+                    else:
+                        st.dataframe(tornado_df.style.format({"rNPV": "{:.0f}", "Delta": "{:+,.0f}"}))
+                        if go is not None:
+                            tornado_fig = go.Figure()
+                            pos = tornado_df[tornado_df["Delta"] >= 0]
+                            neg = tornado_df[tornado_df["Delta"] < 0]
+                            tornado_fig.add_trace(
+                                go.Bar(
+                                    y=pos["Driver"],
+                                    x=pos["Delta"],
+                                    orientation="h",
+                                    name="Positive",
+                                )
                             )
-                        )
-                        tornado_fig.add_trace(
-                            go.Bar(
-                                y=neg["Driver"],
-                                x=neg["Delta"],
-                                orientation="h",
-                                name="Negative",
+                            tornado_fig.add_trace(
+                                go.Bar(
+                                    y=neg["Driver"],
+                                    x=neg["Delta"],
+                                    orientation="h",
+                                    name="Negative",
+                                )
                             )
-                        )
-                        tornado_fig.update_layout(barmode="relative", title="Tornado impact")
-                        st.plotly_chart(tornado_fig, use_container_width=True)
+                            tornado_fig.update_layout(barmode="relative", title="Tornado impact")
+                            st.plotly_chart(tornado_fig, use_container_width=True)
 
-                        spider_fig = go.Figure()
-                        pivot = tornado_df.pivot(index="Driver", columns="Change", values="rNPV").fillna(base_rnpv)
-                        spider_fig.add_trace(
-                            go.Scatterpolar(r=pivot.get("+20%", [base_rnpv]), theta=pivot.index, name="Upside")
-                        )
-                        spider_fig.add_trace(
-                            go.Scatterpolar(r=pivot.get("-20%", [base_rnpv]), theta=pivot.index, name="Downside")
-                        )
-                        st.plotly_chart(spider_fig, use_container_width=True)
+                            spider_fig = go.Figure()
+                            pivot = tornado_df.pivot(index="Driver", columns="Change", values="rNPV").fillna(base_rnpv)
+                            spider_fig.add_trace(
+                                go.Scatterpolar(r=pivot.get("+20%", [base_rnpv]), theta=pivot.index, name="Upside")
+                            )
+                            spider_fig.add_trace(
+                                go.Scatterpolar(r=pivot.get("-20%", [base_rnpv]), theta=pivot.index, name="Downside")
+                            )
+                            st.plotly_chart(spider_fig, use_container_width=True)
 
             with st.expander("Regression & classification models", expanded=False):
-                reg_df = _run_linear_regressions(cons)
-                if reg_df is not None:
-                    st.table(reg_df.style.format({"Intercept": "{:.0f}", "Revenue beta": "{:.2f}", "R^2": "{:.2f}"}))
-                else:
-                    st.info("Install scikit-learn to unlock regression diagnostics.")
+                regression_params = {"section": "regression_classification"}
+                _render_lazy_result_notice(
+                    "analytics_regression_classification",
+                    label="regression and classification diagnostics",
+                    base_signature=base_run_signature,
+                    params=regression_params,
+                    run_label="Run regression & classification",
+                )
+                if st.button("Run regression & classification", key="analytics_run_regression_classification"):
+                    _run_cached_lazy_analytics(
+                        "analytics_regression_classification",
+                        base_signature=base_run_signature,
+                        params=regression_params,
+                        compute=lambda: {
+                            "reg_df": _run_linear_regressions(cons),
+                            "class_df": _run_classification_model(_build_segmentation_table(valuation_result)),
+                        },
+                    )
+                regression_bundle = _last_lazy_result("analytics_regression_classification")
+                if regression_bundle is not None:
+                    reg_df = regression_bundle["reg_df"]
+                    if reg_df is not None:
+                        st.table(reg_df.style.format({"Intercept": "{:.0f}", "Revenue beta": "{:.2f}", "R^2": "{:.2f}"}))
+                    else:
+                        st.info("Install scikit-learn to unlock regression diagnostics.")
 
-                seg_df = _build_segmentation_table(valuation_result)
-                class_df = _run_classification_model(seg_df)
-                if class_df is not None:
-                    st.dataframe(class_df.style.format({
-                        "Revenue share": "{:.1%}",
-                        "EBITDA margin": "{:.1%}",
-                        "High-margin probability": "{:.1%}",
-                    }))
-                else:
-                    st.caption("Classification output requires scikit-learn and at least one product.")
+                    class_df = regression_bundle["class_df"]
+                    if class_df is not None:
+                        st.dataframe(class_df.style.format({
+                            "Revenue share": "{:.1%}",
+                            "EBITDA margin": "{:.1%}",
+                            "High-margin probability": "{:.1%}",
+                        }))
+                    else:
+                        st.caption("Classification output requires scikit-learn and at least one product.")
 
             with st.expander("Time-series & ML forecasting", expanded=False):
                 ts_metric = st.selectbox("Series to forecast", ["revenue", "ebitda"], key="forecast_metric")
@@ -9311,81 +9754,179 @@ def main() -> None:
                     )
                 else:
                     horizon = st.slider("Forecast steps", 5, horizon_max, horizon_default)
-                if st.button("Run time-series model"):
-                    fe = ForecastEngine(model_cfg)
-                    period_index = pd.period_range(str(model_cfg.first_year), periods=len(cons), freq="Y")
-                    series = pd.Series(cons[ts_metric].values, index=period_index)
-                    series.index = series.index.to_timestamp()
-                    try:
-                        if method == "ARIMA":
-                            forecast = fe.forecast_arima(series, steps=horizon)
-                            st.line_chart(forecast)
-                        elif method == "Prophet":
-                            hist_df = pd.DataFrame({"ds": series.index, "y": series.values})
-                            forecast = fe.forecast_prophet(hist_df, periods=horizon)
-                            st.line_chart(forecast.set_index("ds")["yhat"])
-                        else:
+                forecast_params = {
+                    "metric": ts_metric,
+                    "method": method,
+                    "horizon": int(horizon),
+                }
+                _render_lazy_result_notice(
+                    "analytics_forecast",
+                    label="forecast results",
+                    base_signature=base_run_signature,
+                    params=forecast_params,
+                    run_label="Run time-series model",
+                )
+                if st.button("Run time-series model", key="analytics_run_forecast"):
+                    def _compute_forecast() -> Dict[str, Any]:
+                        fe = ForecastEngine(model_cfg)
+                        period_index = pd.period_range(str(model_cfg.first_year), periods=len(cons), freq="Y")
+                        series = pd.Series(cons[ts_metric].values, index=period_index)
+                        series.index = series.index.to_timestamp()
+                        try:
+                            if method == "ARIMA":
+                                forecast = fe.forecast_arima(series, steps=horizon)
+                                return {"series": forecast, "error": None}
+                            if method == "Prophet":
+                                hist_df = pd.DataFrame({"ds": series.index, "y": series.values})
+                                forecast = fe.forecast_prophet(hist_df, periods=horizon)
+                                return {"series": forecast.set_index("ds")["yhat"], "error": None}
                             forecast = fe.forecast_lstm(series, steps_ahead=horizon)
-                            st.line_chart(pd.Series(forecast))
-                    except Exception as exc:
-                        st.warning(f"Forecast failed: {exc}")
+                            return {"series": pd.Series(forecast), "error": None}
+                        except Exception as exc:
+                            return {"series": None, "error": str(exc)}
+
+                    _run_cached_lazy_analytics(
+                        "analytics_forecast",
+                        base_signature=base_run_signature,
+                        params=forecast_params,
+                        compute=_compute_forecast,
+                    )
+                forecast_bundle = _last_lazy_result("analytics_forecast")
+                if forecast_bundle is not None:
+                    if forecast_bundle["error"]:
+                        st.warning(f"Forecast failed: {forecast_bundle['error']}")
+                    elif forecast_bundle["series"] is not None:
+                        st.line_chart(forecast_bundle["series"])
 
             with st.expander("Optimisation, portfolio design & real options", expanded=False):
-                opt_df = _optimize_operations(cons)
-                if opt_df is not None:
-                    st.table(opt_df.style.format({"Value": "{:.2f}"}))
-                else:
-                    st.caption("Install SciPy to enable nonlinear optimisation.")
-
-                mv_df = _mean_variance_portfolio(valuation_result)
-                if mv_df is not None:
-                    st.dataframe(
-                        mv_df.style.format({"Mean": "{:.0f}", "Std": "{:.0f}", "Suggested weight": "{:.1%}"})
+                optimisation_params = {"section": "optimisation"}
+                _render_lazy_result_notice(
+                    "analytics_optimisation",
+                    label="optimisation outputs",
+                    base_signature=base_run_signature,
+                    params=optimisation_params,
+                    run_label="Run optimisation analysis",
+                )
+                if st.button("Run optimisation analysis", key="analytics_run_optimisation"):
+                    _run_cached_lazy_analytics(
+                        "analytics_optimisation",
+                        base_signature=base_run_signature,
+                        params=optimisation_params,
+                        compute=lambda: {
+                            "opt_df": _optimize_operations(cons),
+                            "mv_df": _mean_variance_portfolio(valuation_result),
+                            "option_val": _real_options_value(valuation_result),
+                        },
                     )
+                optimisation_bundle = _last_lazy_result("analytics_optimisation")
+                if optimisation_bundle is not None:
+                    opt_df = optimisation_bundle["opt_df"]
+                    if opt_df is not None:
+                        st.table(opt_df.style.format({"Value": "{:.2f}"}))
+                    else:
+                        st.caption("Install SciPy to enable nonlinear optimisation.")
 
-                option_val = _real_options_value(valuation_result)
-                if option_val is not None:
-                    st.write(f"Real option (deferral) value estimate: {option_val:,.0f}")
-                else:
-                    st.caption("Provide R&D cash flows and install SciPy to compute real options.")
+                    mv_df = optimisation_bundle["mv_df"]
+                    if mv_df is not None:
+                        st.dataframe(
+                            mv_df.style.format({"Mean": "{:.0f}", "Std": "{:.0f}", "Suggested weight": "{:.1%}"})
+                        )
+
+                    option_val = optimisation_bundle["option_val"]
+                    if option_val is not None:
+                        st.write(f"Real option (deferral) value estimate: {option_val:,.0f}")
+                    else:
+                        st.caption("Provide R&D cash flows and install SciPy to compute real options.")
 
             with st.expander("Risk, copulas, macro & ESG linkages", expanded=False):
-                copula_df = _copula_simulation(cons)
-                if copula_df is not None:
-                    st.scatter_chart(copula_df)
-
                 macro_cols = st.columns(4)
                 inflation = macro_cols[0].slider("Inflation", 0.0, 0.15, 0.03)
                 gdp = macro_cols[1].slider("GDP growth", -0.05, 0.1, 0.02)
                 fx = macro_cols[2].slider("FX depreciation", -0.1, 0.2, 0.0)
                 sentiment = macro_cols[3].slider("Market sentiment", -0.3, 0.3, 0.0)
-                macro_revenue = cons["revenue"] * (1 + inflation + gdp + sentiment - fx)
-                st.line_chart(pd.DataFrame({"Original": cons["revenue"], "Macro-adjusted": macro_revenue}))
 
                 esg_cols = st.columns(3)
                 carbon_price = esg_cols[0].slider("Carbon price ($/t)", 0, 200, 75)
                 emissions = esg_cols[1].slider("Emissions (kt)", 0, 500, 120)
                 renewable_share = esg_cols[2].slider("Renewable share", 0.0, 1.0, 0.35)
-                esg_cost = carbon_price * emissions * (1 - renewable_share)
-                st.write(f"ESG-adjusted annual carbon cost: {esg_cost:,.0f}")
-
                 intel_score = st.slider("Market intelligence sentiment", -1.0, 1.0, 0.1)
-                st.write(
-                    f"Sentiment-adjusted revenue uplift: {(intel_score * 5):+.1f}% applied to TAM during scenario planning."
+                risk_params = {
+                    "inflation": float(inflation),
+                    "gdp": float(gdp),
+                    "fx": float(fx),
+                    "sentiment": float(sentiment),
+                    "carbon_price": float(carbon_price),
+                    "emissions": float(emissions),
+                    "renewable_share": float(renewable_share),
+                    "intel_score": float(intel_score),
+                }
+                _render_lazy_result_notice(
+                    "analytics_risk_macro_esg",
+                    label="risk, macro, and ESG analysis",
+                    base_signature=base_run_signature,
+                    params=risk_params,
+                    run_label="Run risk and ESG analysis",
                 )
+                if st.button("Run risk and ESG analysis", key="analytics_run_risk_macro_esg"):
+                    _run_cached_lazy_analytics(
+                        "analytics_risk_macro_esg",
+                        base_signature=base_run_signature,
+                        params=risk_params,
+                        compute=lambda: {
+                            "copula_df": _copula_simulation(cons),
+                            "macro_df": pd.DataFrame(
+                                {
+                                    "Original": cons["revenue"],
+                                    "Macro-adjusted": cons["revenue"] * (1 + inflation + gdp + sentiment - fx),
+                                }
+                            ),
+                            "esg_cost": carbon_price * emissions * (1 - renewable_share),
+                            "sentiment_uplift": intel_score * 5,
+                        },
+                    )
+                risk_bundle = _last_lazy_result("analytics_risk_macro_esg")
+                if risk_bundle is not None:
+                    copula_df = risk_bundle["copula_df"]
+                    if copula_df is not None:
+                        st.scatter_chart(copula_df)
+                    st.line_chart(risk_bundle["macro_df"])
+                    st.write(f"ESG-adjusted annual carbon cost: {risk_bundle['esg_cost']:,.0f}")
+                    st.write(
+                        f"Sentiment-adjusted revenue uplift: {risk_bundle['sentiment_uplift']:+.1f}% applied to TAM during scenario planning."
+                    )
 
             with st.expander("Comparative & ML-based valuation", expanded=False):
-                cluster_df = _cluster_products(valuation_result)
-                if cluster_df is not None:
-                    st.dataframe(cluster_df)
-                else:
-                    st.caption("Need scikit-learn and multiple products for clustering.")
+                comparative_params = {"section": "comparative_ml"}
+                _render_lazy_result_notice(
+                    "analytics_comparative_ml",
+                    label="comparative and ML valuation outputs",
+                    base_signature=base_run_signature,
+                    params=comparative_params,
+                    run_label="Run comparative valuation analysis",
+                )
+                if st.button("Run comparative valuation analysis", key="analytics_run_comparative_ml"):
+                    _run_cached_lazy_analytics(
+                        "analytics_comparative_ml",
+                        base_signature=base_run_signature,
+                        params=comparative_params,
+                        compute=lambda: {
+                            "cluster_df": _cluster_products(valuation_result),
+                            "ml_mult_df": _machine_learning_multiple(cons),
+                        },
+                    )
+                comparative_bundle = _last_lazy_result("analytics_comparative_ml")
+                if comparative_bundle is not None:
+                    cluster_df = comparative_bundle["cluster_df"]
+                    if cluster_df is not None:
+                        st.dataframe(cluster_df)
+                    else:
+                        st.caption("Need scikit-learn and multiple products for clustering.")
 
-                ml_mult_df = _machine_learning_multiple(cons)
-                if ml_mult_df is not None:
-                    st.line_chart(ml_mult_df.set_index("Year"))
-                else:
-                    st.caption("Install scikit-learn to run ML-driven multiple predictions.")
+                    ml_mult_df = comparative_bundle["ml_mult_df"]
+                    if ml_mult_df is not None:
+                        st.line_chart(ml_mult_df.set_index("Year"))
+                    else:
+                        st.caption("Install scikit-learn to run ML-driven multiple predictions.")
 
     if active_section == "VC helper":
         st.subheader("VC method helper")
@@ -9516,25 +10057,9 @@ def get_state() -> dict:
     JSON cleanly. Portfolio and ValuationResult are omitted — they are rebuilt
     from product_table + model_config on the next render.
     """
-    import streamlit as _st
-    state: dict = {}
+    return _capture_biotech_input_state()
 
     # ModelConfig dataclass → plain dict
-    model_cfg = _st.session_state.get("model_config")
-    if model_cfg is not None:
-        from dataclasses import asdict as _asdict
-        try:
-            state["model_config"] = _asdict(model_cfg)
-        except TypeError:
-            pass  # not a dataclass, skip
-
-    # DataFrames and scalars
-    for key in _BIOTECH_DF_KEYS + _BIOTECH_SCALAR_KEYS:
-        val = _st.session_state.get(key)
-        if val is not None:
-            state[key] = val
-
-    return state
 
 
 def set_state(state: dict) -> None:
@@ -9549,13 +10074,28 @@ def set_state(state: dict) -> None:
 
     if "model_config" in state:
         try:
-            _st.session_state["model_config"] = ModelConfig(**state["model_config"])
+            st.session_state["draft_model_config"] = ModelConfig(**state["model_config"])
         except (TypeError, KeyError):
             pass  # schema changed; leave unset so main() uses defaults
 
     for key in _BIOTECH_DF_KEYS + _BIOTECH_SCALAR_KEYS:
         if key in state:
-            _st.session_state[key] = state[key]
+            st.session_state[key] = state[key]
+
+    for transient_key in [
+        "model_config",
+        "portfolio",
+        "valuation_result",
+        "biotech_draft_signature",
+        "biotech_last_run_signature",
+        "biotech_last_run_valuation_signature",
+        "biotech_last_run_version",
+        _BIOTECH_RUN_STATE_KEY,
+        "financial_excel_bytes",
+        _BIOTECH_LAZY_ANALYTICS_STATE_KEY,
+    ]:
+        st.session_state.pop(transient_key, None)
+    st.session_state["biotech_results_stale"] = True
 
 
 if __name__ == "__main__":
