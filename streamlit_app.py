@@ -1204,6 +1204,10 @@ def _table_editor_revision_key(session_key: str) -> str:
     return f"{session_key}_editor_revision"
 
 
+def _table_editor_skip_writeback_key(session_key: str) -> str:
+    return f"{session_key}_editor_skip_writeback"
+
+
 def _table_editor_key(session_key: str) -> str:
     revision = int(st.session_state.get(_table_editor_revision_key(session_key), 0))
     return f"{session_key}_editor_{revision}"
@@ -1212,6 +1216,7 @@ def _table_editor_key(session_key: str) -> str:
 def _bump_table_editor_revision(session_key: str) -> None:
     revision_key = _table_editor_revision_key(session_key)
     st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+    st.session_state[_table_editor_skip_writeback_key(session_key)] = True
 
 
 def _parse_pool_targets(raw_value: str, fallback_ids: List[str]) -> List[str]:
@@ -1965,6 +1970,8 @@ def _render_product_assumption_table(
         key=_table_editor_key(session_key),
         column_config=column_config,
     )
+    if st.session_state.pop(_table_editor_skip_writeback_key(session_key), False):
+        edited_df = df
     if session_key == "vaccine_sales_table":
         edited_df = _recompute_vaccine_sales_implied_revenue(edited_df)
     st.session_state[session_key] = edited_df
