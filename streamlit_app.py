@@ -2526,10 +2526,15 @@ def _default_debt_schedule(first_year: int, n_years: int) -> pd.DataFrame:
     years = list(range(int(first_year), int(first_year) + int(n_years)))
     seed_drawdowns = [60_000_000.0, 20_000_000.0, 20_000_000.0, 20_000_000.0]
     drawdowns = seed_drawdowns[: len(years)] + [0.0] * max(0, len(years) - len(seed_drawdowns))
+    tenors = [
+        max(1, len(years) - idx) if float(drawdowns[idx]) > 0 else 0
+        for idx in range(len(years))
+    ]
     return pd.DataFrame(
         {
             "Year": years,
             "Debt drawdowns": drawdowns,
+            "Loan tenor (years)": tenors,
             "Manual debt repayments": [0.0] * len(years),
         }
     )
@@ -2543,12 +2548,60 @@ def _blank_debt_schedule_row(df: pd.DataFrame, first_year: int, n_years: int) ->
     return {
         "Year": year,
         "Debt drawdowns": 0.0,
+        "Loan tenor (years)": 1.0,
         "Manual debt repayments": 0.0,
     }
 
 
 def _coerce_numeric(series: pd.Series, default: float = 0.0) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(default)
+
+
+def _default_tenor_for_year(year: object, first_year: int, n_years: int) -> int:
+    try:
+        year_value = int(float(year))
+    except (TypeError, ValueError):
+        return max(1, int(n_years))
+
+    horizon_end = int(first_year) + int(n_years) - 1
+    return max(1, horizon_end - year_value + 1)
+
+
+def _normalize_debt_schedule_table(
+    debt_schedule: Optional[pd.DataFrame],
+    first_year: int,
+    n_years: int,
+) -> pd.DataFrame:
+    template = _default_debt_schedule(int(first_year), int(n_years))
+    schedule = _align_table_to_template(debt_schedule, template)
+    if schedule.empty:
+        return template.copy()
+
+    normalized = schedule.copy()
+    years = pd.to_numeric(normalized.get("Year"), errors="coerce")
+    default_tenors = years.apply(
+        lambda value: _default_tenor_for_year(value, int(first_year), int(n_years))
+    )
+    drawdowns = pd.to_numeric(
+        normalized.get("Debt drawdowns", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0.0)
+    tenor_values = pd.to_numeric(
+        normalized.get("Loan tenor (years)", pd.Series(dtype=float)),
+        errors="coerce",
+    )
+    tenor_values = tenor_values.where(~tenor_values.isna(), default_tenors)
+    tenor_values = tenor_values.clip(lower=0).round()
+    tenor_values = tenor_values.where(drawdowns > 0, 0.0)
+
+    normalized["Year"] = years.where(~years.isna(), normalized.get("Year"))
+    normalized["Debt drawdowns"] = drawdowns
+    normalized["Loan tenor (years)"] = tenor_values.astype(float)
+    normalized["Manual debt repayments"] = pd.to_numeric(
+        normalized.get("Manual debt repayments", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0.0)
+    return normalized
 
 
 def _set_dataframe_cell(df: pd.DataFrame, row_idx: int, column_name: str, value: object) -> None:
@@ -4934,21 +4987,37 @@ def _apply_debt_schedule(
         return cash_flow_df
 
     updated = cash_flow_df.copy()
-    schedule = debt_schedule.copy()
-    if "Year" not in schedule.columns:
+    if "Year" not in debt_schedule.columns:
         return cash_flow_df
 
-    template = _default_debt_schedule(int(updated.index.min()), len(updated.index))
-    schedule = _align_table_to_template(schedule, template)
-    schedule["Year"] = pd.to_numeric(schedule["Year"], errors="coerce").astype("Int64")
-    schedule = schedule.dropna(subset=["Year"]).set_index("Year")
-    if schedule.index.has_duplicates:
-        schedule = schedule.groupby(level=0).sum()
-    schedule = schedule.reindex(updated.index).fillna(0.0)
+    years = list(updated.index)
+    first_year = int(min(years))
+    total_years = len(years)
+    year_to_index = {int(year): idx for idx, year in enumerate(years)}
 
-    drawdowns = pd.to_numeric(schedule.get("Debt drawdowns", 0.0), errors="coerce").fillna(0.0)
+    schedule = _normalize_debt_schedule_table(debt_schedule, first_year, total_years)
+    schedule["Year"] = pd.to_numeric(schedule["Year"], errors="coerce")
+    schedule = schedule.dropna(subset=["Year"]).copy()
+    schedule["Year"] = schedule["Year"].astype(int)
+    schedule["Loan tenor (years)"] = (
+        pd.to_numeric(schedule.get("Loan tenor (years)", 0.0), errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+        .round()
+    )
+    schedule["Debt drawdowns"] = pd.to_numeric(
+        schedule.get("Debt drawdowns", 0.0), errors="coerce"
+    ).fillna(0.0)
+    schedule["Manual debt repayments"] = pd.to_numeric(
+        schedule.get("Manual debt repayments", 0.0), errors="coerce"
+    ).fillna(0.0)
+    schedule = schedule.sort_values(["Year", "Loan tenor (years)", "Debt drawdowns"])
+
+    drawdowns = (
+        schedule.groupby("Year")["Debt drawdowns"].sum().reindex(updated.index).fillna(0.0)
+    )
     manual_repayments = (
-        pd.to_numeric(schedule.get("Manual debt repayments", 0.0), errors="coerce").fillna(0.0)
+        schedule.groupby("Year")["Manual debt repayments"].sum().reindex(updated.index).fillna(0.0)
     )
     net_ops = _coerce_frame_column(updated, "Net cash from operations")
     net_investing = _coerce_frame_column(updated, "Net cash from investing")
@@ -4970,30 +5039,128 @@ def _apply_debt_schedule(
     ending_cash = []
     net_financing = []
     net_change = []
-    balance = 0.0
     cash_balance = opening_cash
-    years = list(updated.index)
-    total_years = len(years)
+    facilities_by_start: Dict[int, List[Dict[str, float]]] = {}
+    for _, row in schedule.iterrows():
+        draw = float(row.get("Debt drawdowns", 0.0) or 0.0)
+        tenor = max(int(float(row.get("Loan tenor (years)", 0.0) or 0.0)), 0)
+        start_idx = year_to_index.get(int(row.get("Year")))
+        if start_idx is None or draw <= 0 or tenor <= 0:
+            continue
+        maturity_idx = min(start_idx + tenor - 1, total_years - 1)
+        facilities_by_start.setdefault(start_idx, []).append(
+            {
+                "remaining_balance": draw,
+                "maturity_idx": float(maturity_idx),
+            }
+        )
+
+    def _allocate_principal(
+        facilities: List[Dict[str, float]],
+        base_allocations: Dict[int, float],
+        total_amount: float,
+    ) -> Dict[int, float]:
+        allocations = dict(base_allocations)
+        remaining_amount = max(float(total_amount or 0.0), 0.0)
+        eligible = [
+            facility
+            for facility in facilities
+            if float(facility["remaining_balance"]) - allocations.get(id(facility), 0.0) > 1e-9
+        ]
+        while remaining_amount > 1e-9 and eligible:
+            weight_total = sum(
+                float(facility.get("scheduled_weight", 0.0) or 0.0) if float(facility.get("scheduled_weight", 0.0) or 0.0) > 0 else 1.0
+                for facility in eligible
+            )
+            if weight_total <= 0:
+                weight_total = float(len(eligible))
+
+            distributed = 0.0
+            next_eligible: List[Dict[str, float]] = []
+            for facility in eligible:
+                capacity = max(
+                    float(facility["remaining_balance"]) - allocations.get(id(facility), 0.0),
+                    0.0,
+                )
+                if capacity <= 1e-9:
+                    continue
+                raw_weight = float(facility.get("scheduled_weight", 0.0) or 0.0)
+                weight = raw_weight if raw_weight > 0 else 1.0
+                share = remaining_amount * (weight / weight_total)
+                increment = min(share, capacity)
+                if increment <= 0:
+                    continue
+                allocations[id(facility)] = allocations.get(id(facility), 0.0) + increment
+                distributed += increment
+                if capacity - increment > 1e-9:
+                    next_eligible.append(facility)
+            if distributed <= 1e-9:
+                break
+            remaining_amount -= distributed
+            eligible = next_eligible
+        return allocations
+
+    active_facilities: List[Dict[str, float]] = []
     for idx, year in enumerate(years):
+        for facility in active_facilities:
+            facility["opening_balance"] = float(facility.get("remaining_balance", 0.0) or 0.0)
+        for facility in facilities_by_start.get(idx, []):
+            active_facilities.append(
+                {
+                    "remaining_balance": float(facility["remaining_balance"]),
+                    "maturity_idx": float(facility["maturity_idx"]),
+                    "opening_balance": 0.0,
+                }
+            )
+        active_facilities = [
+            facility
+            for facility in active_facilities
+            if float(facility.get("remaining_balance", 0.0) or 0.0) > 1e-9
+            and idx <= int(facility["maturity_idx"])
+        ]
+
         draw = float(drawdowns.loc[year]) if year in drawdowns.index else 0.0
         manual_principal = float(manual_repayments.loc[year]) if year in manual_repayments.index else 0.0
-        outstanding = max(balance + draw, 0.0)
-        interest = balance * float(interest_rate)
-        if idx == total_years - 1:
-            desired_principal = outstanding
-        elif normalized_mode == "manual":
-            desired_principal = manual_principal
-        elif idx < grace_periods:
-            desired_principal = 0.0
+        balance = sum(float(facility.get("opening_balance", 0.0) or 0.0) for facility in active_facilities)
+        outstanding = sum(float(facility.get("remaining_balance", 0.0) or 0.0) for facility in active_facilities)
+        interest = sum(
+            float(facility.get("opening_balance", 0.0) or 0.0) * float(interest_rate)
+            for facility in active_facilities
+        )
+        mandatory_principal = 0.0
+        straight_line_total = 0.0
+        weight_total = 0.0
+        for facility in active_facilities:
+            remaining_periods = max(int(facility["maturity_idx"]) - idx + 1, 1)
+            facility["remaining_periods"] = float(remaining_periods)
+            is_maturity_year = idx == int(facility["maturity_idx"])
+            scheduled_weight = 0.0
+            if normalized_mode != "bullet" and idx >= grace_periods:
+                scheduled_weight = float(facility["remaining_balance"]) / remaining_periods
+            facility["scheduled_weight"] = max(scheduled_weight, 0.0)
+            facility["mandatory_principal"] = (
+                float(facility["remaining_balance"]) if is_maturity_year else 0.0
+            )
+            mandatory_principal += float(facility["mandatory_principal"])
+            straight_line_total += float(facility["scheduled_weight"])
+            weight_total += (
+                float(facility["scheduled_weight"])
+                if float(facility["scheduled_weight"]) > 0
+                else 1.0
+            )
+
+        if normalized_mode == "manual":
+            total_desired_principal = max(manual_principal, mandatory_principal)
         elif normalized_mode == "bullet":
-            desired_principal = 0.0
+            total_desired_principal = mandatory_principal
+        elif idx < grace_periods:
+            total_desired_principal = mandatory_principal
         elif normalized_mode == "sculpted_dscr":
             cfads = float(net_ops.loc[year] + net_investing.loc[year])
             max_service = max(cfads / dscr_target, 0.0)
-            desired_principal = max(max_service - interest, 0.0)
+            total_desired_principal = max(max_service - interest, mandatory_principal, 0.0)
         else:
-            remaining_periods = max(total_years - max(idx, grace_periods), 1)
-            desired_principal = outstanding / remaining_periods
+            total_desired_principal = max(straight_line_total, mandatory_principal)
 
         cash_before_principal = (
             cash_balance
@@ -5003,10 +5170,32 @@ def _apply_debt_schedule(
             + draw
             - interest
         )
-        principal = min(max(desired_principal, 0.0), outstanding)
+        discretionary_principal = max(total_desired_principal - mandatory_principal, 0.0)
         if idx < total_years - 1:
-            principal = min(principal, max(cash_before_principal - reserve_floor, 0.0))
-        end_balance = max(outstanding - principal, 0.0)
+            discretionary_cap = max(
+                max(cash_before_principal - reserve_floor, 0.0) - mandatory_principal,
+                0.0,
+            )
+            discretionary_principal = min(discretionary_principal, discretionary_cap)
+        principal_allocations = {
+            id(facility): float(facility.get("mandatory_principal", 0.0) or 0.0)
+            for facility in active_facilities
+        }
+        principal_allocations = _allocate_principal(
+            active_facilities,
+            principal_allocations,
+            discretionary_principal,
+        )
+        principal = sum(principal_allocations.values())
+        end_balance = outstanding
+        next_active: List[Dict[str, float]] = []
+        for facility in active_facilities:
+            facility_principal = principal_allocations.get(id(facility), 0.0)
+            remaining_balance = max(float(facility["remaining_balance"]) - facility_principal, 0.0)
+            facility["remaining_balance"] = remaining_balance
+            end_balance -= facility_principal
+            if remaining_balance > 1e-9 and idx < int(facility["maturity_idx"]):
+                next_active.append(facility)
         financing_cash = float(equity_issuance.loc[year]) + draw - principal - interest
         total_cash_change = float(net_ops.loc[year] + net_investing.loc[year] + financing_cash)
         ending_cash_balance = cash_balance + total_cash_change
@@ -5020,8 +5209,8 @@ def _apply_debt_schedule(
         net_financing.append(financing_cash)
         net_change.append(total_cash_change)
 
-        balance = end_balance
         cash_balance = ending_cash_balance
+        active_facilities = next_active
 
     updated["Debt drawdowns"] = pd.Series(drawdowns.values, index=updated.index)
     updated["Manual debt repayments"] = pd.Series(manual_repayments.values, index=updated.index)
@@ -7252,17 +7441,20 @@ def main() -> None:
 
             if show_uses_sources:
                 with st.expander("Debt schedule inputs", expanded=False):
-                    debt_template = _default_debt_schedule(int(first_year), int(n_years))
                     debt_table_changed = (
                         st.session_state.get("debt_schedule_first_year") != int(first_year)
                         or st.session_state.get("debt_schedule_n_years") != int(n_years)
                     )
                     if debt_table_changed or "debt_schedule_table" not in st.session_state:
-                        st.session_state["debt_schedule_table"] = debt_template
+                        st.session_state["debt_schedule_table"] = _default_debt_schedule(
+                            int(first_year),
+                            int(n_years),
+                        )
                     else:
-                        st.session_state["debt_schedule_table"] = _align_table_to_template(
+                        st.session_state["debt_schedule_table"] = _normalize_debt_schedule_table(
                             st.session_state.get("debt_schedule_table"),
-                            debt_template,
+                            int(first_year),
+                            int(n_years),
                         )
                     st.session_state["debt_schedule_first_year"] = int(first_year)
                     st.session_state["debt_schedule_n_years"] = int(n_years)
@@ -7341,19 +7533,41 @@ def main() -> None:
                             "Debt drawdowns": st.column_config.NumberColumn(
                                 "Debt drawdowns", step=1_000_000.0
                             ),
+                            "Loan tenor (years)": st.column_config.NumberColumn(
+                                "Loan tenor (years)",
+                                min_value=0.0,
+                                step=1.0,
+                            ),
                             "Manual debt repayments": st.column_config.NumberColumn(
                                 "Manual debt repayments",
                                 step=1_000_000.0,
                             ),
                         },
                     )
+                    debt_schedule_df = _normalize_debt_schedule_table(
+                        debt_schedule_df,
+                        int(first_year),
+                        int(n_years),
+                    )
                     st.session_state["debt_schedule_table"] = debt_schedule_df
                     st.caption(
-                        "Drawdowns stay manual. Repayments follow the selected mode; the manual repayment column is used only when Manual schedule is selected."
+                        "Each row represents a debt facility introduced in that year. Loan tenor limits how long the facility stays active; after maturity its balance and interest stop unless a later row introduces new debt."
                     )
                     debt_warnings = []
                     if (pd.to_numeric(debt_schedule_df.get("Debt drawdowns", pd.Series(dtype=float)), errors="coerce") < 0).any():
                         debt_warnings.append("Debt drawdowns should be zero or positive.")
+                    tenor_values = pd.to_numeric(
+                        debt_schedule_df.get("Loan tenor (years)", pd.Series(dtype=float)),
+                        errors="coerce",
+                    ).fillna(0.0)
+                    if (tenor_values < 0).any():
+                        debt_warnings.append("Loan tenor should be zero or positive.")
+                    debt_draw_values = pd.to_numeric(
+                        debt_schedule_df.get("Debt drawdowns", pd.Series(dtype=float)),
+                        errors="coerce",
+                    ).fillna(0.0)
+                    if ((debt_draw_values > 0) & (tenor_values <= 0)).any():
+                        debt_warnings.append("Each positive debt drawdown needs a positive loan tenor.")
                     if (
                         pd.to_numeric(
                             debt_schedule_df.get("Manual debt repayments", pd.Series(dtype=float)),
