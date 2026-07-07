@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -355,6 +356,67 @@ class StreamlitHelperTests(unittest.TestCase):
             any("Validation issues detected:" in element.value for element in app.error),
             [element.value for element in app.error],
         )
+
+    def test_product_assumption_table_uses_fresh_editor_key_after_row_edit(self) -> None:
+        old_df = pd.DataFrame(
+            [
+                {"Year": 2025, "Debt drawdowns": 0.0},
+                {"Year": 2026, "Debt drawdowns": 100.0},
+            ]
+        )
+        session_state = {
+            "debt_schedule_table": old_df.copy(),
+            "debt_schedule_table_edit_open": True,
+        }
+        action_cols = [contextlib.nullcontext() for _ in range(4)]
+        editor_keys: list[str] = []
+
+        def fake_selectbox(_label, *, options, **kwargs):
+            value = options[1]
+            key = kwargs.get("key")
+            if key:
+                session_state[key] = value
+            return value
+
+        def fake_data_editor(df, **kwargs):
+            editor_keys.append(kwargs["key"])
+            if kwargs["key"] == "debt_schedule_table_editor_0":
+                return old_df.copy()
+            return df.copy()
+
+        with patch("streamlit_app.st.session_state", session_state):
+            with patch("streamlit_app._render_row_selector", return_value=1):
+                with patch("streamlit_app.st.columns", return_value=action_cols), patch(
+                    "streamlit_app.st.checkbox", side_effect=[False, False]
+                ), patch("streamlit_app.st.button", return_value=False), patch(
+                    "streamlit_app.st.caption"
+                ), patch("streamlit_app.st.success"), patch(
+                    "streamlit_app.st.markdown"
+                ), patch(
+                    "streamlit_app.st.selectbox", side_effect=fake_selectbox
+                ), patch(
+                    "streamlit_app._render_row_form",
+                    return_value=("save", {"Year": 2026, "Debt drawdowns": 250.0}),
+                ), patch(
+                    "streamlit_app.st.rerun"
+                ), patch(
+                    "streamlit_app.st.data_editor", side_effect=fake_data_editor
+                ), patch(
+                    "streamlit_app._validate_selection"
+                ):
+                    from streamlit_app import _render_product_assumption_table
+
+                    result_df = _render_product_assumption_table(
+                        session_key="debt_schedule_table",
+                        default_factory=lambda: old_df.copy(),
+                        blank_row_factory=lambda df: {"Year": 2027, "Debt drawdowns": 0.0},
+                        id_column=None,
+                        name_column="Year",
+                    )
+
+        self.assertEqual(editor_keys, ["debt_schedule_table_editor_1"])
+        self.assertEqual(float(result_df.loc[1, "Debt drawdowns"]), 250.0)
+        self.assertEqual(float(session_state["debt_schedule_table"].loc[1, "Debt drawdowns"]), 250.0)
 
     def test_machine_learning_multiple_handles_object_numeric_inputs(self) -> None:
         cons = pd.DataFrame(
