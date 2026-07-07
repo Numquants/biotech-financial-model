@@ -1298,6 +1298,7 @@ def _render_row_selector(
     select_key: str,
     id_column: Optional[str],
     name_column: Optional[str],
+    label: str = "Row for remove / increment",
 ) -> Optional[int]:
     pending = _consume_pending_selection(select_key)
 
@@ -1324,7 +1325,7 @@ def _render_row_selector(
         return _format_row_label(df, idx, id_column, name_column)
 
     selected_value = st.selectbox(
-        "Select row",
+        label,
         options=option_values,
         format_func=_format,
         index=option_values.index(default_value),
@@ -1559,6 +1560,106 @@ def _widget_value(label: str, value, key: str):
     return st.text_input(label, value=safe_value, key=key)
 
 
+def _widget_seed_value(label: str, value):
+    label_lower = label.lower()
+    if label == "Stage":
+        return value if value in STAGE_OPTIONS else STAGE_OPTIONS[0]
+
+    bool_like = isinstance(value, (bool, np.bool_)) or label_lower in {
+        "include_in_consolidation",
+        "consolidation",
+        "participating preferred",
+    }
+    if bool_like:
+        return bool(value)
+
+    numeric_like = isinstance(value, (int, float, np.number)) or (
+        isinstance(value, str) and value.strip().replace(".", "", 1).isdigit()
+    )
+    if numeric_like:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            numeric_value = 0.0
+        if pd.isna(numeric_value):
+            numeric_value = 0.0
+        return float(numeric_value)
+
+    if value is None or pd.isna(value):
+        return ""
+    return str(value)
+
+
+def _row_form_widget_key(section_key: str, form_key: str, column: str) -> str:
+    return f"{section_key}_{form_key}_{column}"
+
+
+def _row_form_source_key(section_key: str, form_key: str) -> str:
+    return f"{section_key}_{form_key}_source"
+
+
+def _prime_row_form_state(
+    section_key: str,
+    form_key: str,
+    columns: List[str],
+    initial_values: Dict,
+    source_token: Optional[object],
+) -> None:
+    if source_token is None:
+        return
+    source_key = _row_form_source_key(section_key, form_key)
+    if st.session_state.get(source_key) == source_token:
+        return
+    for col in columns:
+        widget_key = _row_form_widget_key(section_key, form_key, col)
+        st.session_state[widget_key] = _widget_seed_value(col, initial_values.get(col, ""))
+    st.session_state[source_key] = source_token
+
+
+def _clear_row_form_state(section_key: str, form_key: str, columns: List[str]) -> None:
+    for col in columns:
+        st.session_state.pop(_row_form_widget_key(section_key, form_key, col), None)
+    st.session_state.pop(_row_form_source_key(section_key, form_key), None)
+
+
+def _required_row_fields(
+    columns: List[str],
+    id_column: Optional[str],
+    name_column: Optional[str],
+    initial_values: Optional[Dict] = None,
+) -> List[str]:
+    required: List[str] = []
+    for candidate in [id_column, name_column, "Year", "Date", "Stage"]:
+        if candidate and candidate in columns and candidate not in required:
+            required.append(candidate)
+    if required:
+        return required
+
+    identifier_keywords = ("id", "name", "title", "item", "year", "date", "stage", "pool", "type")
+    for col in columns:
+        lower_col = col.lower()
+        sample = initial_values.get(col) if initial_values is not None else None
+        if any(keyword in lower_col for keyword in identifier_keywords) or isinstance(sample, str):
+            required.append(col)
+            break
+    return required
+
+
+def _validate_row_form_values(values: Dict, required_fields: List[str]) -> List[str]:
+    errors: List[str] = []
+    for field in required_fields:
+        value = values.get(field)
+        if value is None:
+            errors.append(f"{field} is required.")
+            continue
+        if isinstance(value, str) and not value.strip():
+            errors.append(f"{field} is required.")
+            continue
+        if isinstance(value, (float, np.floating)) and pd.isna(value):
+            errors.append(f"{field} is required.")
+    return errors
+
+
 def _render_row_form(
     *,
     section_key: str,
@@ -1567,48 +1668,150 @@ def _render_row_form(
     columns: List[str],
     initial_values: Dict,
     submit_label: str,
-) -> Optional[Dict]:
+    required_fields: Optional[List[str]] = None,
+    cancel_label: Optional[str] = None,
+    source_token: Optional[object] = None,
+) -> Tuple[Optional[str], Optional[Dict]]:
     """Generic helper that renders a form for editing/adding a row."""
+
+    _prime_row_form_state(section_key, form_key, columns, initial_values, source_token)
 
     with st.form(f"{section_key}_{form_key}"):
         st.caption(title)
         new_values: Dict = {}
         for col in columns:
             val = initial_values.get(col, "")
-            widget_key = f"{section_key}_{form_key}_{col}"
+            widget_key = _row_form_widget_key(section_key, form_key, col)
             new_values[col] = _widget_value(col, val, widget_key)
-        submitted = st.form_submit_button(submit_label, use_container_width=True)
+        if cancel_label:
+            submit_col, cancel_col = st.columns(2)
+            with submit_col:
+                submitted = st.form_submit_button(submit_label, use_container_width=True)
+            with cancel_col:
+                cancelled = st.form_submit_button(cancel_label, use_container_width=True)
+        else:
+            submitted = st.form_submit_button(submit_label, use_container_width=True)
+            cancelled = False
+    if cancelled:
+        return "cancel", None
     if submitted:
-        return new_values
-    return None
+        validation_errors = _validate_row_form_values(new_values, required_fields or [])
+        if validation_errors:
+            for message in validation_errors:
+                st.error(message)
+            return None, None
+        return "save", new_values
+    return None, None
+
+
+def _edit_workflow_select_key(section_key: str) -> str:
+    return f"{section_key}_edit_row_select"
+
+
+def _row_notice_key(section_key: str) -> str:
+    return f"{section_key}_row_notice"
+
+
+def _render_edit_button(
+    section_key: str,
+    df: pd.DataFrame,
+    selected_idx: Optional[int],
+    id_column: Optional[str],
+    name_column: Optional[str],
+) -> None:
+    if st.button(
+        "Edit row",
+        key=f"{section_key}_edit_trigger",
+        use_container_width=True,
+        disabled=df.empty,
+    ):
+        panel_key = _panel_state_key(section_key, "edit")
+        st.session_state[panel_key] = True
+        if not df.empty:
+            identity_column = _selection_identity_column(df, id_column, name_column)
+            default_idx = selected_idx if selected_idx is not None and selected_idx in df.index else df.index[0]
+            st.session_state[_edit_workflow_select_key(section_key)] = _row_identifier(
+                df,
+                default_idx,
+                identity_column,
+            )
 
 
 def _edit_selected_row(
     section_key: str,
     df: pd.DataFrame,
     selected_idx: Optional[int],
+    select_key: str,
+    id_column: Optional[str],
+    name_column: Optional[str],
 ) -> pd.DataFrame:
-    """Allow inline editing of the currently selected row."""
+    """Allow editing through an explicit row-selection workflow."""
 
-    if df.empty or selected_idx is None:
-        st.caption("Select a row to edit.")
+    panel_key = _panel_state_key(section_key, "edit")
+    if not st.session_state.get(panel_key, False):
         return df
 
+    if df.empty:
+        st.session_state[panel_key] = False
+        return df
+
+    row_indexes = list(df.index)
+    identity_column = _selection_identity_column(df, id_column, name_column)
+    option_values = [_row_identifier(df, idx, identity_column) for idx in row_indexes]
+    option_to_index = dict(zip(option_values, row_indexes))
+    selected_value = st.session_state.get(_edit_workflow_select_key(section_key))
+    default_idx = _resolve_selected_index_from_value(df, selected_value, identity_column)
+    if default_idx is None or default_idx not in row_indexes:
+        default_idx = selected_idx if selected_idx is not None and selected_idx in df.index else row_indexes[0]
+    default_value = _row_identifier(df, default_idx, identity_column)
+    if st.session_state.get(_edit_workflow_select_key(section_key)) != default_value:
+        st.session_state[_edit_workflow_select_key(section_key)] = default_value
+
+    st.markdown("**Edit selected row**")
+    st.caption("Choose the record to edit, review the pre-filled values, then save or cancel.")
+    edit_value = st.selectbox(
+        "Choose row to edit",
+        options=option_values,
+        format_func=lambda option_value: _format_row_label(
+            df,
+            option_to_index.get(option_value, default_idx),
+            id_column,
+            name_column,
+        ),
+        index=option_values.index(default_value),
+        key=_edit_workflow_select_key(section_key),
+    )
+    edit_idx = option_to_index.get(edit_value, default_idx)
+
     columns = list(df.columns)
-    initial_values = df.loc[selected_idx].to_dict()
-    edited_values = _render_row_form(
+    initial_values = df.loc[edit_idx].to_dict()
+    required_fields = _required_row_fields(columns, id_column, name_column, initial_values)
+    action, edited_values = _render_row_form(
         section_key=section_key,
         form_key="edit",
-        title="Edit selected row",
+        title="Update the selected row",
         columns=columns,
         initial_values=initial_values,
-        submit_label="Save changes",
+        submit_label="Save",
+        required_fields=required_fields,
+        cancel_label="Cancel",
+        source_token=edit_value,
     )
-    if edited_values is not None:
+    if action == "cancel":
+        _clear_row_form_state(section_key, "edit", columns)
+        st.session_state[panel_key] = False
+        st.session_state.pop(_edit_workflow_select_key(section_key), None)
+        st.rerun()
+    if action == "save" and edited_values is not None:
         for col, val in edited_values.items():
-            _set_dataframe_cell(df, selected_idx, col, val)
+            _set_dataframe_cell(df, edit_idx, col, val)
         st.session_state[section_key] = df
-        st.success("Row updated")
+        _set_pending_selection(select_key, _row_identifier(df, edit_idx, identity_column))
+        _clear_row_form_state(section_key, "edit", columns)
+        st.session_state[panel_key] = False
+        st.session_state[_row_notice_key(section_key)] = "Row updated"
+        st.session_state.pop(_edit_workflow_select_key(section_key), None)
+        st.rerun()
     return st.session_state.get(section_key, df)
 
 
@@ -1625,7 +1828,7 @@ def _add_row_via_form(
     template_row = blank_row_factory(df.copy())
     columns = list(df.columns) if not df.empty else list(template_row.keys())
     initial_values = {col: template_row.get(col, "") for col in columns}
-    new_row = _render_row_form(
+    action, new_row = _render_row_form(
         section_key=section_key,
         form_key="add",
         title="Add a new row",
@@ -1633,7 +1836,7 @@ def _add_row_via_form(
         initial_values=initial_values,
         submit_label="Add row",
     )
-    if new_row is not None:
+    if action == "save" and new_row is not None:
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         st.session_state[section_key] = df
         identity_column = _selection_identity_column(df, id_column, name_column)
@@ -1690,15 +1893,13 @@ def _render_product_assumption_table(
     _consume_pending_panel_state(edit_panel_key)
     _consume_pending_panel_state(add_panel_key)
     _consume_pending_panel_state(increment_panel_key)
+    notice = st.session_state.pop(_row_notice_key(session_key), None)
+    if notice:
+        st.success(notice)
 
     action_cols = st.columns(4)
     with action_cols[0]:
-        edit_open = st.checkbox(
-            "Edit",
-            value=bool(st.session_state.get(edit_panel_key, False)),
-            key=edit_panel_key,
-            help="Open the focused row editor for the selected row.",
-        )
+        _render_edit_button(session_key, df, selected_idx, id_column, name_column)
     with action_cols[1]:
         add_open = st.checkbox(
             "Add Row",
@@ -1723,11 +1924,10 @@ def _render_product_assumption_table(
             help="Open the yearly increment helper for the selected row.",
         )
 
-    if edit_open:
-        st.caption("Focused row editor: update one selected row at a time.")
-        df = _edit_selected_row(session_key, df, selected_idx)
+    if st.session_state.get(edit_panel_key, False):
+        df = _edit_selected_row(session_key, df, selected_idx, select_key, id_column, name_column)
     else:
-        st.caption("Tick `Edit` to open the focused row editor for the selected row.")
+        st.caption("Click `Edit row` to choose the record you want to update.")
 
     if add_open:
         st.caption("Add a new row with all fields visible before it is inserted into the table.")
