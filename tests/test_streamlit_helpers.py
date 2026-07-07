@@ -19,6 +19,7 @@ from streamlit_app import (
     _build_portfolio,
     _machine_learning_multiple,
     _build_probability_preview,
+    _default_debt_schedule,
     _default_stage_schedule_mapping,
     _consume_pending_panel_state,
     _pending_panel_state_key,
@@ -35,6 +36,98 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitHelperTests(unittest.TestCase):
+    def test_default_debt_schedule_includes_tenor_column(self) -> None:
+        schedule = _default_debt_schedule(2025, 5)
+
+        self.assertIn("Loan tenor (years)", schedule.columns)
+        self.assertEqual(schedule.loc[0, "Loan tenor (years)"], 5)
+        self.assertEqual(schedule.loc[4, "Loan tenor (years)"], 0)
+
+    def test_apply_debt_schedule_respects_facility_tenor_and_later_new_debt(self) -> None:
+        cash_flow_df = pd.DataFrame(
+            {
+                "Net cash from operations": [0.0, 0.0, 0.0, 0.0],
+                "Net cash from investing": [0.0, 0.0, 0.0, 0.0],
+                "Equity issuance": [0.0, 0.0, 0.0, 0.0],
+                "Beginning cash balance": [0.0, 0.0, 0.0, 0.0],
+            },
+            index=[2025, 2026, 2027, 2028],
+        )
+        debt_schedule = pd.DataFrame(
+            [
+                {
+                    "Year": 2025,
+                    "Debt drawdowns": 100.0,
+                    "Loan tenor (years)": 2.0,
+                    "Manual debt repayments": 0.0,
+                },
+                {
+                    "Year": 2027,
+                    "Debt drawdowns": 60.0,
+                    "Loan tenor (years)": 1.0,
+                    "Manual debt repayments": 0.0,
+                },
+            ]
+        )
+
+        updated = _apply_debt_schedule(cash_flow_df, debt_schedule, 0.10)
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertAlmostEqual(float(updated.loc[2025, "Debt opening balance"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2025, "Debt repayments"]), 50.0)
+        self.assertAlmostEqual(float(updated.loc[2025, "Debt closing balance"]), 50.0)
+        self.assertAlmostEqual(float(updated.loc[2026, "Interest paid"]), 5.0)
+        self.assertAlmostEqual(float(updated.loc[2026, "Debt closing balance"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2027, "Debt opening balance"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2027, "Debt repayments"]), 60.0)
+        self.assertAlmostEqual(float(updated.loc[2027, "Debt closing balance"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2028, "Debt opening balance"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2028, "Interest paid"]), 0.0)
+
+    def test_apply_debt_schedule_forces_manual_maturity_paydown(self) -> None:
+        cash_flow_df = pd.DataFrame(
+            {
+                "Net cash from operations": [0.0, 0.0, 0.0],
+                "Net cash from investing": [0.0, 0.0, 0.0],
+                "Equity issuance": [0.0, 0.0, 0.0],
+                "Beginning cash balance": [0.0, 0.0, 0.0],
+            },
+            index=[2025, 2026, 2027],
+        )
+        debt_schedule = pd.DataFrame(
+            [
+                {
+                    "Year": 2025,
+                    "Debt drawdowns": 120.0,
+                    "Loan tenor (years)": 2.0,
+                    "Manual debt repayments": 0.0,
+                },
+                {
+                    "Year": 2026,
+                    "Debt drawdowns": 0.0,
+                    "Loan tenor (years)": 0.0,
+                    "Manual debt repayments": 10.0,
+                },
+            ]
+        )
+
+        updated = _apply_debt_schedule(
+            cash_flow_df,
+            debt_schedule,
+            0.10,
+            repayment_mode="manual",
+        )
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertAlmostEqual(float(updated.loc[2025, "Debt repayments"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2025, "Debt closing balance"]), 120.0)
+        self.assertAlmostEqual(float(updated.loc[2026, "Interest paid"]), 12.0)
+        self.assertAlmostEqual(float(updated.loc[2026, "Debt repayments"]), 120.0)
+        self.assertAlmostEqual(float(updated.loc[2026, "Debt closing balance"]), 0.0)
+        self.assertAlmostEqual(float(updated.loc[2027, "Interest paid"]), 0.0)
+
     def test_consume_pending_panel_state_applies_deferred_checkbox_value(self) -> None:
         session_state = {
             "uses_table_add_open": True,
