@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import load_workbook
+from streamlit.errors import StreamlitAPIException
 from streamlit.testing.v1 import AppTest
 
 from streamlit_app import (
@@ -46,6 +47,27 @@ class StreamlitHelperTests(unittest.TestCase):
         self.assertFalse(pending)
         self.assertFalse(session_state["uses_table_add_open"])
         self.assertNotIn(_pending_panel_state_key("uses_table_add_open"), session_state)
+
+    def test_consume_pending_panel_state_requeues_when_checkbox_key_is_locked(self) -> None:
+        class LockedState(dict):
+            def __setitem__(self, key, value):
+                if key == "debt_schedule_table_add_open":
+                    raise StreamlitAPIException("locked")
+                super().__setitem__(key, value)
+
+        session_state = LockedState(
+            {
+                _pending_panel_state_key("debt_schedule_table_add_open"): False,
+            }
+        )
+
+        with patch("streamlit_app.st.session_state", session_state):
+            pending = _consume_pending_panel_state("debt_schedule_table_add_open")
+
+        self.assertIsNone(pending)
+        self.assertIn(_pending_panel_state_key("debt_schedule_table_add_open"), session_state)
+        self.assertFalse(session_state[_pending_panel_state_key("debt_schedule_table_add_open")])
+        self.assertNotIn("debt_schedule_table_add_open", session_state)
 
     def test_set_dataframe_cell_upcasts_for_incompatible_editor_value(self) -> None:
         df = pd.DataFrame({"Year": [2025]})

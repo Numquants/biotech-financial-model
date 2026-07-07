@@ -6399,6 +6399,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    _clear_legacy_row_form_widget_state(st.session_state)
     _inject_app_theme()
     _render_model_hero()
 
@@ -8979,6 +8980,27 @@ _BIOTECH_SCALAR_KEYS = [
 ]
 
 
+_BIOTECH_ROW_FORM_SECTION_KEYS = [
+    key for key in _BIOTECH_DF_KEYS if key != "stage_schedule_mapping"
+] + [
+    "shared_capex_pools_table",
+    "shared_capex_allocations_table",
+]
+
+
+def _clear_legacy_row_form_widget_state(session_state: Dict[str, object]) -> None:
+    """Remove transient row-form keys that should never survive across renders.
+
+    Older biotech builds could leave `*_open` form/widget state behind. On the
+    current Streamlit runtime, replaying those keys after the form is created
+    raises a StreamlitAPIException and crashes the page.
+    """
+
+    for section_key in _BIOTECH_ROW_FORM_SECTION_KEYS:
+        session_state.pop(f"{section_key}_add_open", None)
+        session_state.pop(f"{section_key}_edit_open", None)
+
+
 def get_state() -> dict:
     """Snapshot all user-editable inputs.
 
@@ -9014,6 +9036,8 @@ def set_state(state: dict) -> None:
     directly to session_state; portfolio is rebuilt by main() on next render.
     """
     import streamlit as _st
+
+    _clear_legacy_row_form_widget_state(_st.session_state)
 
     if "model_config" in state:
         try:

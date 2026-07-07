@@ -6,6 +6,7 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 
 def _pending_selection_key(select_key: str) -> str:
@@ -28,7 +29,13 @@ def _consume_pending_state(pending_key: str, state_key: str) -> Optional[object]
     if pending_key not in st.session_state:
         return None
     value = st.session_state.pop(pending_key)
-    st.session_state[state_key] = value
+    try:
+        st.session_state[state_key] = value
+    except StreamlitAPIException:
+        # If the widget key is already locked for this run, keep the deferred
+        # value queued for the next rerun instead of crashing the app.
+        st.session_state[pending_key] = value
+        return None
     return value
 
 
