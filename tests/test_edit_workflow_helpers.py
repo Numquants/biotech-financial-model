@@ -60,6 +60,20 @@ class EditWorkflowHelperTests(unittest.TestCase):
         self.assertNotIn("uses_table_edit_Amount", session_state)
         self.assertNotIn("uses_table_edit_source", session_state)
 
+    def test_clear_legacy_row_form_state_preserves_active_edit_workflow_flag(self) -> None:
+        active_edit_key = streamlit_app._panel_state_key("uses_table", "edit")
+        session_state = {
+            "uses_table_add_open": True,
+            "uses_table_edit_open": True,
+            active_edit_key: True,
+        }
+
+        streamlit_app._clear_legacy_row_form_widget_state(session_state)
+
+        self.assertNotIn("uses_table_add_open", session_state)
+        self.assertNotIn("uses_table_edit_open", session_state)
+        self.assertTrue(session_state[active_edit_key])
+
     def test_debt_schedule_edit_persists_when_editor_returns_stale_frame(self) -> None:
         old_df = pd.DataFrame(
             [
@@ -91,7 +105,7 @@ class EditWorkflowHelperTests(unittest.TestCase):
         }
         session_state = {
             "debt_schedule_table": old_df.copy(),
-            "debt_schedule_table_edit_open": True,
+            streamlit_app._panel_state_key("debt_schedule_table", "edit"): True,
             "debt_schedule_table_edit_row_select": 2026,
             "debt_schedule_table_edit_Year": 2026.0,
             "debt_schedule_table_edit_Debt drawdowns": 20_000_000.0,

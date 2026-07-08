@@ -14,6 +14,8 @@ def _pending_selection_key(select_key: str) -> str:
 
 
 def _panel_state_key(section_key: str, panel_name: str) -> str:
+    if panel_name == "edit":
+        return f"{section_key}_edit_workflow_open"
     return f"{section_key}_{panel_name}_open"
 
 
@@ -147,3 +149,4 @@ def _validate_selection(
     selected_id = _row_identifier(df, selected_idx, identity_column)
     if selected_id != st.session_state.get(select_key):
         _set_pending_selection(select_key, selected_id)
+
