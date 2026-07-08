@@ -366,7 +366,7 @@ class StreamlitHelperTests(unittest.TestCase):
         )
         session_state = {
             "debt_schedule_table": old_df.copy(),
-            "debt_schedule_table_edit_open": True,
+            "debt_schedule_table_edit_workflow_open": True,
         }
         action_cols = [contextlib.nullcontext() for _ in range(4)]
         editor_keys: list[str] = []
@@ -793,3 +793,4 @@ class StreamlitHelperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
