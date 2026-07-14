@@ -6851,6 +6851,37 @@ def _render_rag_assistant_page() -> None:
         )
 
 
+def _resolve_valuation_context(
+    candidate_model_cfg: ModelConfig,
+    candidate_portfolio: Portfolio | None,
+) -> tuple[ModelConfig | None, Portfolio | None, object | None, list[str], bool]:
+    """Compatibility helper for callers that still request an immediate context resolution."""
+
+    saved_model_cfg = st.session_state.get("model_config")
+    saved_portfolio = st.session_state.get("portfolio")
+    saved_valuation_result = st.session_state.get("valuation_result")
+    used_saved_outputs = saved_valuation_result is not None
+
+    if candidate_portfolio is None:
+        return saved_model_cfg, saved_portfolio, saved_valuation_result, [], used_saved_outputs
+
+    validation_issues = validate_portfolio(candidate_portfolio)
+    if validation_issues:
+        return (
+            saved_model_cfg,
+            saved_portfolio,
+            saved_valuation_result,
+            validation_issues,
+            used_saved_outputs,
+        )
+
+    valuation_result = ValuationEngine(candidate_portfolio).run()
+    st.session_state["model_config"] = candidate_model_cfg
+    st.session_state["portfolio"] = candidate_portfolio
+    st.session_state["valuation_result"] = valuation_result
+    return candidate_model_cfg, candidate_portfolio, valuation_result, [], False
+
+
 _BIOTECH_BASE_VALUATION_CACHE_KEY = "_biotech_base_valuation_cache"
 _BIOTECH_LAZY_ANALYTICS_CACHE_KEY = "_biotech_lazy_analytics_cache"
 _BIOTECH_LAZY_ANALYTICS_STATE_KEY = "_biotech_lazy_analytics_state"
