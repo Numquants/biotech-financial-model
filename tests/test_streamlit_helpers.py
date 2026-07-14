@@ -342,13 +342,17 @@ class StreamlitHelperTests(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0, app.exception)
 
-    def test_streamlit_app_default_run_populates_outputs(self) -> None:
+    def test_streamlit_app_default_run_waits_for_explicit_action(self) -> None:
         app = AppTest.from_file(str(APP_PATH))
 
         app.run(timeout=120)
 
         self.assertEqual(len(app.exception), 0, app.exception)
         self.assertTrue(
+            any(button.label == "Run Model" for button in app.button),
+            [button.label for button in app.button],
+        )
+        self.assertFalse(
             any("Run complete:" in element.value for element in app.success),
             [element.value for element in app.success],
         )
