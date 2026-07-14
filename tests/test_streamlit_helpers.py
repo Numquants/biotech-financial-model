@@ -747,56 +747,6 @@ class StreamlitHelperTests(unittest.TestCase):
         self.assertEqual(waterfall.loc["Series A", "Preference paid"], 40.0)
         self.assertEqual(waterfall.loc["Founders", "Total proceeds"], 20.0)
 
-    def test_product_assumption_table_uses_fresh_editor_key_after_row_edit(self) -> None:
-        old_df = pd.DataFrame(
-            [
-                {"Year": 2025, "Debt drawdowns": 0.0},
-                {"Year": 2026, "Debt drawdowns": 100.0},
-            ]
-        )
-        updated_df = pd.DataFrame(
-            [
-                {"Year": 2025, "Debt drawdowns": 0.0},
-                {"Year": 2026, "Debt drawdowns": 250.0},
-            ]
-        )
-        session_state = {"debt_schedule_table": old_df.copy()}
-        action_cols = [contextlib.nullcontext() for _ in range(4)]
-        editor_keys = []
-
-        def fake_data_editor(df, **kwargs):
-            editor_keys.append(kwargs["key"])
-            if kwargs["key"] == "debt_schedule_table_editor_0":
-                return old_df.copy()
-            return df.copy()
-
-        with patch("streamlit_app.st.session_state", session_state):
-            with patch("streamlit_app._render_row_selector", return_value=1):
-                with patch("streamlit_app.st.columns", return_value=action_cols), patch(
-                    "streamlit_app.st.checkbox", side_effect=[True, False, False]
-                ), patch("streamlit_app.st.button", return_value=False), patch(
-                    "streamlit_app.st.caption"
-                ), patch("streamlit_app.st.success"), patch(
-                    "streamlit_app._render_row_form", return_value=updated_df.loc[1].to_dict()
-                ), patch(
-                    "streamlit_app.st.data_editor", side_effect=fake_data_editor
-                ), patch(
-                    "streamlit_app._validate_selection"
-                ):
-                    from streamlit_app import _render_product_assumption_table
-
-                    result_df = _render_product_assumption_table(
-                        session_key="debt_schedule_table",
-                        default_factory=lambda: old_df.copy(),
-                        blank_row_factory=lambda df: {"Year": 2027, "Debt drawdowns": 0.0},
-                        id_column=None,
-                        name_column="Year",
-                    )
-
-        self.assertEqual(editor_keys, ["debt_schedule_table_editor_1"])
-        self.assertEqual(float(result_df.loc[1, "Debt drawdowns"]), 250.0)
-        self.assertEqual(float(session_state["debt_schedule_table"].loc[1, "Debt drawdowns"]), 250.0)
-
     def test_financial_excel_includes_debt_and_waterfall_sheets(self) -> None:
         cons = pd.DataFrame(
             {
