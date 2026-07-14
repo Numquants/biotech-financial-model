@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import io
 import importlib
 import os
 import re
 from contextlib import contextmanager
+from functools import lru_cache
 from io import BytesIO
 from dataclasses import asdict, fields
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -121,6 +124,8 @@ TERMINAL_METHOD_LABELS = {
 }
 TERMINAL_METHOD_CODES = {label: code for code, label in TERMINAL_METHOD_LABELS.items()}
 
+_HERO_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "numquants_biotech.png"
+
 
 def _inject_app_theme() -> None:
     st.markdown(
@@ -145,14 +150,45 @@ def _inject_app_theme() -> None:
             max-width: 1450px;
         }
         .designer-hero {
+            --bio-hero-overlay: linear-gradient(
+                90deg,
+                rgba(239, 250, 244, 0.98) 0%,
+                rgba(239, 250, 244, 0.94) 44%,
+                rgba(239, 250, 244, 0.70) 69%,
+                rgba(15, 23, 42, 0.15) 100%
+            );
+            position: relative;
+            isolation: isolate;
+            overflow: hidden;
             margin-bottom: 1.2rem;
             padding: 1.8rem 1.9rem;
+            min-height: 19rem;
             border-radius: 28px;
             border: 1px solid rgba(20, 83, 45, 0.12);
-            background:
-                linear-gradient(135deg, rgba(233, 247, 239, 0.96), rgba(255, 255, 255, 0.94)),
-                linear-gradient(135deg, rgba(20, 83, 45, 0.05), rgba(30, 64, 175, 0.07));
+            background: linear-gradient(135deg, #e9f7ef, #ffffff);
             box-shadow: 0 24px 48px rgba(15, 23, 42, 0.08);
+        }
+        .designer-hero-image {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center 66%;
+        }
+        .designer-hero::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            z-index: 1;
+            background: var(--bio-hero-overlay);
+            pointer-events: none;
+        }
+        .designer-hero-content {
+            position: relative;
+            z-index: 2;
+            max-width: 58rem;
         }
         .designer-kicker {
             margin: 0 0 0.45rem 0;
@@ -187,9 +223,28 @@ def _inject_app_theme() -> None:
             border-radius: 999px;
             border: 1px solid rgba(15, 23, 42, 0.08);
             background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(8px);
             color: var(--bio-brand);
             font-size: 0.82rem;
             font-weight: 700;
+        }
+        @media (max-width: 760px) {
+            .designer-hero {
+                --bio-hero-overlay: linear-gradient(
+                    180deg,
+                    rgba(239, 250, 244, 0.98) 0%,
+                    rgba(239, 250, 244, 0.94) 68%,
+                    rgba(15, 23, 42, 0.24) 100%
+                );
+                min-height: 23rem;
+                padding: 1.5rem 1.35rem;
+            }
+            .designer-hero-image {
+                object-position: 58% 66%;
+            }
+            .designer-title {
+                font-size: clamp(2rem, 10vw, 2.65rem);
+            }
         }
         div[data-baseweb="tab-list"] {
             gap: 0.55rem;
@@ -236,6 +291,14 @@ def _inject_app_theme() -> None:
     )
 
 
+@lru_cache(maxsize=1)
+def _hero_image_data_uri() -> str:
+    """Return the bundled hero artwork as a browser-ready data URI."""
+
+    encoded = base64.b64encode(_HERO_IMAGE_PATH.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
 def _render_model_hero() -> None:
     badges = "".join(
         f'<span class="designer-badge">{label}</span>'
@@ -249,13 +312,21 @@ def _render_model_hero() -> None:
     st.markdown(
         f"""
         <section class="designer-hero">
-            <p class="designer-kicker">Pipeline valuation studio</p>
-            <h1 class="designer-title">Biotech Financial Model</h1>
-            <p class="designer-copy">
-                Configure the asset mix, stage assumptions, and portfolio economics in a cleaner
-                executive shell, then export an investor-grade workbook instead of flat worksheets.
-            </p>
-            <div class="designer-badges">{badges}</div>
+            <img
+                class="designer-hero-image"
+                src="{_hero_image_data_uri()}"
+                alt=""
+                aria-hidden="true"
+            />
+            <div class="designer-hero-content">
+                <p class="designer-kicker">Pipeline valuation studio</p>
+                <h1 class="designer-title">Biotech Financial Model</h1>
+                <p class="designer-copy">
+                    Configure the asset mix, stage assumptions, and portfolio economics in a cleaner
+                    executive shell, then export an investor-grade workbook instead of flat worksheets.
+                </p>
+                <div class="designer-badges">{badges}</div>
+            </div>
         </section>
         """,
         unsafe_allow_html=True,
