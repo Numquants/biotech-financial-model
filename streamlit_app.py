@@ -6892,25 +6892,23 @@ def main() -> None:
     portfolio: Portfolio | None = st.session_state.get("portfolio")
     valuation_result = st.session_state.get("valuation_result")
 
-    (
-        config_tab,
-        financial_tab,
-        analytics_tab,
-        dashboard_scenario_tab,
-        vc_tab,
-        rag_tab,
-    ) = st.tabs(
-        [
-            "Model configuration",
-            "Financial statements",
-            "Advanced analytics",
-            "Dashboard & Scenarios",
-            "VC helper",
-            "RAG Assistant",
-        ]
+    section_labels = [
+        "Model configuration",
+        "Financial statements",
+        "Advanced analytics",
+        "Dashboard & Scenarios",
+        "VC helper",
+        "RAG Assistant",
+    ]
+    active_section = st.radio(
+        "Workspace section",
+        section_labels,
+        horizontal=True,
+        key="biotech_active_workspace_section",
+        label_visibility="collapsed",
     )
 
-    with config_tab:
+    if active_section == "Model configuration":
         with _section_block(
             "Model assumptions",
             heading_level=2,
@@ -8533,7 +8531,7 @@ def main() -> None:
                             use_container_width=True,
                         )
 
-    with financial_tab:
+    if active_section == "Financial statements":
         st.subheader("Financial statements")
         if valuation_result is None or model_cfg is None:
             st.info("Run the model configuration tab to populate the statements.")
@@ -8654,7 +8652,7 @@ def main() -> None:
                 if not excel_bytes:
                     st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
 
-    with dashboard_scenario_tab:
+    if active_section == "Dashboard & Scenarios":
         st.subheader("Dashboard & scenarios")
         if valuation_result is None or model_cfg is None:
             st.info("Configure and run the model to see dashboard metrics.")
@@ -8952,7 +8950,7 @@ def main() -> None:
                 else:
                     st.warning("Goal seek failed—try adjusting the target or assumptions.")
 
-    with analytics_tab:
+    if active_section == "Advanced analytics":
         st.subheader("Advanced financial analytics")
         if valuation_result is None or model_cfg is None or portfolio is None:
             st.info("Configure the model to unlock analytics.")
@@ -9389,7 +9387,7 @@ def main() -> None:
                 else:
                     st.caption("Install scikit-learn to run ML-driven multiple predictions.")
 
-    with vc_tab:
+    if active_section == "VC helper":
         st.subheader("VC method helper")
         if valuation_result is None or model_cfg is None:
             st.info("Configure the model and run a valuation before using VC analysis.")
@@ -9434,7 +9432,7 @@ def main() -> None:
                 )
                 st.table(vc_df)
 
-    with rag_tab:
+    if active_section == "RAG Assistant":
         _render_rag_assistant_page()
 
     st.caption(
