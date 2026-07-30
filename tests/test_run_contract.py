@@ -134,3 +134,34 @@ def test_set_state_restores_draft_only_and_clears_computed_outputs(monkeypatch) 
     assert "portfolio" not in fake_state
     assert "valuation_result" not in fake_state
     assert fake_state["biotech_results_stale"] is True
+
+
+def test_run_snapshot_does_not_mutate_instantiated_widget_state(monkeypatch) -> None:
+    class GuardedSessionState(dict):
+        locked_keys: set[str] = set()
+
+        def __setitem__(self, key, value) -> None:
+            if key in self.locked_keys:
+                raise RuntimeError(f"{key} is owned by an instantiated widget")
+            super().__setitem__(key, value)
+
+    fake_state = GuardedSessionState(
+        {
+            "stage_mapping_auto_apply": True,
+            "debt_interest_rate": 0.08,
+        }
+    )
+    fake_state.locked_keys.add("stage_mapping_auto_apply")
+    _install_fake_streamlit(monkeypatch, fake_state)
+
+    with biotech_app._use_biotech_state_snapshot(
+        {
+            "stage_mapping_auto_apply": False,
+            "debt_interest_rate": 0.12,
+        }
+    ):
+        assert biotech_app._biotech_state_value("stage_mapping_auto_apply") is False
+        assert biotech_app._financing_settings_from_state()["interest_rate"] == 0.12
+        assert fake_state["stage_mapping_auto_apply"] is True
+
+    assert biotech_app._biotech_state_value("stage_mapping_auto_apply") is True
