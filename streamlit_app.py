@@ -10,6 +10,7 @@ import importlib
 import os
 import re
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from io import BytesIO
 from dataclasses import asdict, fields
@@ -79,6 +80,19 @@ from valuation_codex_package.ui_state import (
 
 
 STAGE_OPTIONS = list(STAGE_SEQUENCE)
+_BIOTECH_STATE_SNAPSHOT_OVERRIDE: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "biotech_state_snapshot_override",
+    default=None,
+)
+
+
+def _biotech_state_value(key: str, default: Any = None) -> Any:
+    snapshot = _BIOTECH_STATE_SNAPSHOT_OVERRIDE.get()
+    if snapshot is not None and key in snapshot:
+        return snapshot[key]
+    return st.session_state.get(key, default)
+
+
 STAGE_TRANSITION_COLUMNS = [
     f"{from_stage}->{to_stage}"
     for from_stage, to_stage in zip(STAGE_SEQUENCE[:-1], STAGE_SEQUENCE[1:])
@@ -5054,18 +5068,18 @@ def _apply_cash_flow_assumptions(
 
 def _financing_settings_from_state() -> Dict[str, object]:
     repayment_mode_value = str(
-        st.session_state.get("debt_repayment_mode", DEBT_REPAYMENT_LABELS["straight_line"])
+        _biotech_state_value("debt_repayment_mode", DEBT_REPAYMENT_LABELS["straight_line"])
         or DEBT_REPAYMENT_LABELS["straight_line"]
     )
     repayment_mode = DEBT_REPAYMENT_CODES.get(repayment_mode_value, repayment_mode_value)
     if repayment_mode not in DEBT_REPAYMENT_LABELS:
         repayment_mode = "straight_line"
     return {
-        "interest_rate": float(st.session_state.get("debt_interest_rate", 0.0)),
+        "interest_rate": float(_biotech_state_value("debt_interest_rate", 0.0)),
         "repayment_mode": repayment_mode,
-        "grace_years": int(st.session_state.get("debt_grace_years", 0) or 0),
-        "target_dscr": float(st.session_state.get("debt_target_dscr", 1.3) or 1.3),
-        "minimum_cash_reserve": float(st.session_state.get("minimum_cash_reserve", 0.0) or 0.0),
+        "grace_years": int(_biotech_state_value("debt_grace_years", 0) or 0),
+        "target_dscr": float(_biotech_state_value("debt_target_dscr", 1.3) or 1.3),
+        "minimum_cash_reserve": float(_biotech_state_value("minimum_cash_reserve", 0.0) or 0.0),
     }
 
 
@@ -5534,7 +5548,7 @@ def _build_financing_outputs(
     financing_settings = _financing_settings_from_state()
     cash_flow_df = _apply_debt_schedule(
         cash_flow_df,
-        st.session_state.get("debt_schedule_table"),
+        _biotech_state_value("debt_schedule_table"),
         float(financing_settings["interest_rate"]),
         repayment_mode=str(financing_settings["repayment_mode"]),
         grace_years=int(financing_settings["grace_years"]),
@@ -5550,7 +5564,7 @@ def _build_financing_outputs(
     equity_bridge = _build_enterprise_to_equity_bridge(
         valuation_result,
         cash_flow_df,
-        float(st.session_state.get("planned_new_equity", 0.0)),
+        float(_biotech_state_value("planned_new_equity", 0.0)),
     )
     investor_waterfall = pd.DataFrame()
     if not equity_bridge.empty:
@@ -5561,7 +5575,7 @@ def _build_financing_outputs(
             ].iloc[0]
         )
         investor_waterfall = _build_investor_waterfall(
-            st.session_state.get("shareholders_table"),
+            _biotech_state_value("shareholders_table"),
             post_money,
         )
 
@@ -6974,18 +6988,11 @@ def _use_biotech_state_snapshot(snapshot: Optional[Dict[str, Any]]):
         yield
         return
 
-    sentinel = object()
-    previous_values = {key: _copy_state_value(st.session_state.get(key, sentinel)) for key in snapshot}
+    token = _BIOTECH_STATE_SNAPSHOT_OVERRIDE.set(snapshot)
     try:
-        for key, value in snapshot.items():
-            st.session_state[key] = _copy_state_value(value)
         yield
     finally:
-        for key, previous in previous_values.items():
-            if previous is sentinel:
-                st.session_state.pop(key, None)
-            else:
-                st.session_state[key] = previous
+        _BIOTECH_STATE_SNAPSHOT_OVERRIDE.reset(token)
 
 
 def _build_biotech_valuation_signature(model_cfg: ModelConfig, portfolio: Portfolio) -> str:
